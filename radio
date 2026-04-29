@@ -1,0 +1,345 @@
+-- Chat-style radio for CC:Tweaked Advanced Ender Pocket Computers.
+-- Put this file on each pocket computer, edit radio_config.lua, then run: radio
+
+local CONFIG_FILE = "radio_config.lua"
+local PROTOCOL = "pocket_radio_v1"
+
+local defaultConfig = {
+  name = nil, -- nil uses the computer label or ID.
+  frequencies = { 101, 102, 103 },
+  defaultFrequency = 101,
+  maxMessageLength = 180,
+}
+
+local function shallowCopy(source)
+  local out = {}
+  for key, value in pairs(source) do out[key] = value end
+  return out
+end
+
+local function loadConfig()
+  if not fs.exists(CONFIG_FILE) then return shallowCopy(defaultConfig) end
+
+  local ok, config = pcall(dofile, CONFIG_FILE)
+  if not ok or type(config) ~= "table" then
+    error("Bad " .. CONFIG_FILE .. ": it must return a table", 0)
+  end
+
+  for key, value in pairs(defaultConfig) do
+    if config[key] == nil then config[key] = value end
+  end
+
+  return config
+end
+
+local function clampChannel(channel)
+  return type(channel) == "number" and channel >= 0 and channel <= 65535 and channel % 1 == 0
+end
+
+local function buildFrequencySet(frequencies)
+  local set = {}
+  for _, channel in ipairs(frequencies) do
+    if not clampChannel(channel) then
+      error("Frequency must be a whole number from 0 to 65535: " .. tostring(channel), 0)
+    end
+    set[channel] = true
+  end
+  return set
+end
+
+local config = loadConfig()
+local allowed = buildFrequencySet(config.frequencies)
+local activeFrequency = config.defaultFrequency
+
+if not allowed[activeFrequency] then
+  activeFrequency = config.frequencies[1]
+end
+
+local modem = peripheral.find("modem")
+if not modem then error("No modem found. Equip the Ender Modem upgrade first.", 0) end
+
+for _, channel in ipairs(config.frequencies) do
+  if not modem.isOpen(channel) then modem.open(channel) end
+end
+
+local userName = config.name or os.getComputerLabel() or ("#" .. os.getComputerID())
+local maxMessageLength = config.maxMessageLength or defaultConfig.maxMessageLength
+local messages = {}
+local input = ""
+local cursor = 1
+local running = true
+local scrollOffset = 0
+
+local colorsOk = term.isColor()
+
+local function setColor(fg, bg)
+  if colorsOk then
+    if fg then term.setTextColor(fg) end
+    if bg then term.setBackgroundColor(bg) end
+  end
+end
+
+local function addMessage(kind, name, text, channel)
+  messages[#messages + 1] = {
+    kind = kind,
+    name = name,
+    text = tostring(text),
+    channel = channel,
+    time = textutils.formatTime(os.time(), true),
+  }
+
+  if #messages > 200 then table.remove(messages, 1) end
+end
+
+local function wrapText(text, width)
+  local lines = {}
+  text = tostring(text)
+
+  while #text > width do
+    local cut = width
+    for i = width, 1, -1 do
+      if text:sub(i, i) == " " then
+        cut = i - 1
+        break
+      end
+    end
+
+    if cut < 1 then cut = width end
+    lines[#lines + 1] = text:sub(1, cut)
+    text = text:sub(cut + 1):gsub("^%s+", "")
+  end
+
+  lines[#lines + 1] = text
+  return lines
+end
+
+local function renderLine(y, prefix, text, prefixColor, textColor)
+  local width = term.getSize()
+  term.setCursorPos(1, y)
+  term.clearLine()
+
+  setColor(prefixColor)
+  write(prefix)
+  setColor(textColor)
+  write(text:sub(1, math.max(0, width - #prefix)))
+end
+
+local function visibleRows()
+  local _, height = term.getSize()
+  return math.max(1, height - 3)
+end
+
+local function flattenMessages()
+  local width = term.getSize()
+  local rows = {}
+
+  for _, msg in ipairs(messages) do
+    local prefix
+    if msg.kind == "system" then
+      prefix = "* "
+    else
+      prefix = "<" .. msg.name .. "> "
+    end
+
+    local available = math.max(1, width - #prefix)
+    local wrapped = wrapText(msg.text, available)
+
+    for index, line in ipairs(wrapped) do
+      rows[#rows + 1] = {
+        prefix = index == 1 and prefix or string.rep(" ", #prefix),
+        text = line,
+        kind = msg.kind,
+      }
+    end
+  end
+
+  return rows
+end
+
+local function draw()
+  local width, height = term.getSize()
+  term.setBackgroundColor(colors.black)
+  term.clear()
+
+  setColor(colors.white, colors.gray)
+  term.setCursorPos(1, 1)
+  term.clearLine()
+  local title = (" Radio %s | /help "):format(activeFrequency)
+  write(title:sub(1, width))
+
+  local rows = flattenMessages()
+  local rowsVisible = visibleRows()
+  local start = math.max(1, #rows - rowsVisible + 1 - scrollOffset)
+  local finish = math.min(#rows, start + rowsVisible - 1)
+  local y = 2
+
+  for i = start, finish do
+    local row = rows[i]
+    local prefixColor = colors.lightGray
+    local textColor = colors.white
+
+    if row.kind == "system" then
+      prefixColor = colors.yellow
+      textColor = colors.yellow
+    elseif row.kind == "self" then
+      prefixColor = colors.cyan
+    else
+      prefixColor = colors.lime
+    end
+
+    renderLine(y, row.prefix, row.text, prefixColor, textColor)
+    y = y + 1
+  end
+
+  setColor(colors.white, colors.gray)
+  term.setCursorPos(1, height - 1)
+  term.clearLine()
+  write((" Allowed: %s "):format(table.concat(config.frequencies, ", ")):sub(1, width))
+
+  setColor(colors.white, colors.black)
+  term.setCursorPos(1, height)
+  term.clearLine()
+  local prompt = "> "
+  local inputRoom = width - #prompt
+  local shownInput = input
+  local viewStart = 1
+
+  if #shownInput > inputRoom then
+    viewStart = #shownInput - inputRoom + 1
+    shownInput = shownInput:sub(viewStart)
+  end
+
+  write(prompt .. shownInput)
+  term.setCursorPos(#prompt + cursor - viewStart + 1, height)
+  term.setCursorBlink(true)
+end
+
+local function sendRadioMessage(text)
+  text = text:sub(1, maxMessageLength)
+
+  modem.transmit(activeFrequency, activeFrequency, {
+    protocol = PROTOCOL,
+    sender = userName,
+    id = os.getComputerID(),
+    text = text,
+    frequency = activeFrequency,
+  })
+
+  addMessage("self", userName, text, activeFrequency)
+end
+
+local function setFrequency(channel)
+  if not allowed[channel] then
+    addMessage("system", nil, "Frequency " .. channel .. " is locked. Edit " .. CONFIG_FILE .. " to allow it.", activeFrequency)
+    return
+  end
+
+  activeFrequency = channel
+  addMessage("system", nil, "Tuned to frequency " .. channel .. ".", activeFrequency)
+end
+
+local function handleCommand(line)
+  local command, rest = line:match("^/(%S+)%s*(.*)$")
+  command = command and command:lower()
+
+  if command == "freq" or command == "f" then
+    local channel = tonumber(rest)
+    if channel then
+      setFrequency(channel)
+    else
+      addMessage("system", nil, "Usage: /freq " .. tostring(activeFrequency), activeFrequency)
+    end
+  elseif command == "list" then
+    addMessage("system", nil, "Allowed frequencies: " .. table.concat(config.frequencies, ", "), activeFrequency)
+  elseif command == "name" then
+    if rest and #rest > 0 then
+      userName = rest:sub(1, 16)
+      addMessage("system", nil, "Name set to " .. userName .. ".", activeFrequency)
+    else
+      addMessage("system", nil, "Usage: /name Steve", activeFrequency)
+    end
+  elseif command == "clear" then
+    messages = {}
+  elseif command == "quit" or command == "exit" then
+    running = false
+  elseif command == "help" then
+    addMessage("system", nil, "/freq, /list, /name, /clear, /quit", activeFrequency)
+  else
+    addMessage("system", nil, "Unknown command. Try /help.", activeFrequency)
+  end
+end
+
+local function submitInput()
+  local line = input:gsub("^%s+", ""):gsub("%s+$", "")
+  input = ""
+  cursor = 1
+  scrollOffset = 0
+
+  if #line == 0 then return end
+
+  if line:sub(1, 1) == "/" then
+    handleCommand(line)
+  else
+    sendRadioMessage(line)
+  end
+end
+
+local function handleKey(key)
+  if key == keys.enter then
+    submitInput()
+  elseif key == keys.backspace then
+    if cursor > 1 then
+      input = input:sub(1, cursor - 2) .. input:sub(cursor)
+      cursor = cursor - 1
+    end
+  elseif key == keys.delete then
+    input = input:sub(1, cursor - 1) .. input:sub(cursor + 1)
+  elseif key == keys.left then
+    cursor = math.max(1, cursor - 1)
+  elseif key == keys.right then
+    cursor = math.min(#input + 1, cursor + 1)
+  elseif key == keys.home then
+    cursor = 1
+  elseif key == keys["end"] then
+    cursor = #input + 1
+  elseif key == keys.pageUp then
+    scrollOffset = math.min(scrollOffset + visibleRows(), math.max(0, #flattenMessages() - visibleRows()))
+  elseif key == keys.pageDown then
+    scrollOffset = math.max(0, scrollOffset - visibleRows())
+  end
+end
+
+addMessage("system", nil, "Tuned to frequency " .. activeFrequency .. ". Type /help for commands.", activeFrequency)
+
+while running do
+  draw()
+  local event = { os.pullEvent() }
+
+  if event[1] == "char" then
+    if #input < maxMessageLength then
+      input = input:sub(1, cursor - 1) .. event[2] .. input:sub(cursor)
+      cursor = cursor + 1
+    end
+  elseif event[1] == "key" then
+    handleKey(event[2])
+  elseif event[1] == "modem_message" then
+    local channel = event[3]
+    local payload = event[5]
+
+    if channel == activeFrequency and allowed[channel] and type(payload) == "table" and payload.protocol == PROTOCOL then
+      if payload.id ~= os.getComputerID() then
+        addMessage("remote", payload.sender or ("#" .. tostring(payload.id or "?")), payload.text or "", channel)
+        scrollOffset = 0
+      end
+    end
+  elseif event[1] == "term_resize" then
+    scrollOffset = 0
+  end
+end
+
+term.setCursorBlink(false)
+term.setBackgroundColor(colors.black)
+term.setTextColor(colors.white)
+term.clear()
+term.setCursorPos(1, 1)
+print("Radio closed.")
