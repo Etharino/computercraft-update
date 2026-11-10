@@ -503,23 +503,24 @@ for i = 1, 3 do
   STRIP[i] = s
 end
 
--- bottom panel
-local lsc = math.max(1, math.floor(BPH / 18))
-local labelH = 5 * lsc
-local lp = math.max(1, math.floor(BPH * 0.06))
-local labelY = BPY0 + 3 + lp
-local ledY0 = labelY + labelH + lp + 1
+-- bottom panel (kept in one table: CC's Lua caps a scope at 200 locals)
+local BP = {}
+BP.lsc = math.max(1, math.floor(BPH / 18))
+BP.labelH = 5 * BP.lsc
+BP.lp = math.max(1, math.floor(BPH * 0.06))
+BP.labelY = BPY0 + 3 + BP.lp
+BP.ledY0 = BP.labelY + BP.labelH + BP.lp + 1
 -- digit scale: whatever fits between the label and the bottom of the panel
-local dsc = math.max(1, math.floor(((BPY1 - 3 - lp) - ledY0 + 1 - lp * 2 - 4) / 5))
-local function boxW(n, sc) return textW(string.rep("8", n), sc) + lp * 2 + 4 end
-while dsc > 1 and boxW(7, dsc) + boxW(3, dsc) + lp * 8 > BPW * 0.7 do dsc = dsc - 1 end
-local ledH = dsc * 5 + lp * 2 + 4
-local credX0 = BPX0 + lp * 2 + 2
-local credW = boxW(7, dsc)
-local betW = boxW(3, dsc)
-local betX0 = BPX1 - lp * 2 - 2 - betW + 1
-local msgX0, msgX1 = credX0 + credW + lp * 2, betX0 - lp * 2 - 1
-local msgY0, msgY1 = BPY0 + 3, BPY1 - 3
+BP.dsc = math.max(1, math.floor(((BPY1 - 3 - BP.lp) - BP.ledY0 + 1 - BP.lp * 2 - 4) / 5))
+function BP.boxW(n, sc) return textW(string.rep("8", n), sc) + BP.lp * 2 + 4 end
+while BP.dsc > 1 and BP.boxW(7, BP.dsc) + BP.boxW(3, BP.dsc) + BP.lp * 8 > BPW * 0.7 do BP.dsc = BP.dsc - 1 end
+BP.ledH = BP.dsc * 5 + BP.lp * 2 + 4
+BP.credX0 = BPX0 + BP.lp * 2 + 2
+BP.credW = BP.boxW(7, BP.dsc)
+BP.betW = BP.boxW(3, BP.dsc)
+BP.betX0 = BPX1 - BP.lp * 2 - 2 - BP.betW + 1
+BP.msgX0, BP.msgX1 = BP.credX0 + BP.credW + BP.lp * 2, BP.betX0 - BP.lp * 2 - 1
+BP.msgY0, BP.msgY1 = BPY0 + 3, BPY1 - 3
 
 -- lever
 local LV = {}
@@ -546,7 +547,8 @@ local function titleColor(lx, ly)
   return SHINE + r * SHINE_BANDS + b
 end
 
-local function buildScene()
+local Build = {}
+function Build.buildBackground()
   -- background gradient + stars
   for y = 0, PH - 1 do
     local c = BG + clamp(math.floor(y / PH * #BGCOLS), 0, #BGCOLS - 1)
@@ -558,6 +560,9 @@ local function buildScene()
   end
   maybeYield()
 
+end
+
+function Build.buildCabinet()
   -- cabinet: gold bevelled bezel + red body
   local ccx, ccy = (CX0 + CX1) / 2, (CY0 + CY1) / 2
   for y = CY0, CY1 do
@@ -580,6 +585,9 @@ local function buildScene()
     maybeYield()
   end
 
+end
+
+function Build.buildMarquee()
   -- marquee panel + chasing bulbs
   panel(MQX0, MQY0, MQX1, MQY1, 3, PANEL2, GOLD + 5)
   local br = math.max(1, math.floor(MQH * 0.07))
@@ -615,6 +623,9 @@ local function buildScene()
   text(titleX, titleY, title, ts, titleColor, OUTLINE, math.max(1, math.floor(ts / 3)), math.max(1, math.floor(ts / 2)))
   maybeYield()
 
+end
+
+function Build.buildReelBay()
   -- reel bay + window frames
   panel(MQX0, RY0, MQX1, RY1, 2, SHADOW, GOLD + 5)
   for i = 1, 3 do
@@ -645,24 +656,44 @@ local function buildScene()
   end
   maybeYield()
 
+end
+
+function Build.buildBottomPanel()
   -- bottom panel: credits LED, message, bet LED
   panel(BPX0, BPY0, BPX1, BPY1, 3, PANEL, GOLD + 5)
-  panel(credX0, ledY0, credX0 + credW - 1, ledY0 + ledH - 1, 1, LEDBG, GOLD + 2)
-  panel(betX0, ledY0, betX0 + betW - 1, ledY0 + ledH - 1, 1, LEDBG, GOLD + 2)
-  text(credX0 + 1, labelY, "CREDITS", lsc, DIM)
-  text(betX0 + 1, labelY, "BET", lsc, DIM)
+  panel(BP.credX0, BP.ledY0, BP.credX0 + BP.credW - 1, BP.ledY0 + BP.ledH - 1, 1, LEDBG, GOLD + 2)
+  panel(BP.betX0, BP.ledY0, BP.betX0 + BP.betW - 1, BP.ledY0 + BP.ledH - 1, 1, LEDBG, GOLD + 2)
+  text(BP.credX0 + 1, BP.labelY, "CREDITS", BP.lsc, DIM)
+  text(BP.betX0 + 1, BP.labelY, "BET", BP.lsc, DIM)
 
+end
+
+function Build.buildLeverPlate()
   -- lever mount plate
   local plateH = LV.ballR * 3
   local plateTop = LV.py - math.floor(plateH / 2)
   panel(CX1 - BZ, plateTop, LV.px + LV.rodT + 3, LV.py + math.floor(plateH / 2), 2,
     function(_, y) return GOLD + clamp(6 - math.floor((y - plateTop) / plateH * 5), 1, 6) end, GOLD + 7)
 
+end
+
+function Build.takeSnapshots()
   local lvx = math.max(0, LV.px - math.ceil(LV.ballR * 1.4) - 4)
   leverBase = snapshot(lvx, 0, PW - lvx, PH)
-  msgBase = snapshot(msgX0, msgY0, msgX1 - msgX0 + 1, msgY1 - msgY0 + 1)
-  credBase = snapshot(credX0, ledY0, credW, ledH)
-  betBase = snapshot(betX0, ledY0, betW, ledH)
+  msgBase = snapshot(BP.msgX0, BP.msgY0, BP.msgX1 - BP.msgX0 + 1, BP.msgY1 - BP.msgY0 + 1)
+  credBase = snapshot(BP.credX0, BP.ledY0, BP.credW, BP.ledH)
+  betBase = snapshot(BP.betX0, BP.ledY0, BP.betW, BP.ledH)
+end
+
+-- split into pieces because CC's Lua refuses any function with more than 60 upvalues
+local function buildScene()
+  Build.buildBackground()
+  Build.buildCabinet()
+  Build.buildMarquee()
+  Build.buildReelBay()
+  Build.buildBottomPanel()
+  Build.buildLeverPlate()
+  Build.takeSnapshots()
 end
 
 ---------------------------------------------------------------- dynamic parts
@@ -759,9 +790,9 @@ local function drawLED(snap, value, digits)
   local s = tostring(math.floor(value))
   if #s > digits then s = string.rep("9", digits) end
   s = string.rep(" ", digits - #s) .. s
-  local tx, ty = snap.x + lp + 2, snap.y + lp + 2
-  text(tx, ty, string.rep("8", digits), dsc, LEDOFF)
-  text(tx, ty, s, dsc, LEDON, LEDGLOW, 1)
+  local tx, ty = snap.x + BP.lp + 2, snap.y + BP.lp + 2
+  text(tx, ty, string.rep("8", digits), BP.dsc, LEDOFF)
+  text(tx, ty, s, BP.dsc, LEDON, LEDGLOW, 1)
   push(snap.x, snap.y, snap.w, snap.h)
 end
 
