@@ -85,7 +85,7 @@ local SETTINGS = {
 
   -- Look
   HUD_X = 6, HUD_Y = 6, HUD_WIDTH = 250,
-  ALERT_SECONDS     = 15,
+  ALERT_SECONDS     = 6,
   MARKER_LABELS     = false,           -- floating text over managers (off = just the box)
 
   -- Marker alignment (same as blockvision): if boxes sit one block off,
@@ -132,6 +132,25 @@ end
 -- Who "you" are. Filled from the glasses, or learned from the player
 -- standing exactly where the glasses are (some builds don't report a name).
 local SELF = { name = nil }
+if fs.exists("/.glasses_me") then
+  local f = fs.open("/.glasses_me", "r")
+  local n = (f.readAll() or ""):gsub("%s", ""); f.close()
+  if n ~= "" then SELF.name = n end
+end
+local function setSelf(n)
+  SELF.name = n
+  local f = fs.open("/.glasses_me", "w"); f.write(n); f.close()
+end
+-- Given { name = distance }, the wearer is the closest player, and they
+-- must be within 4 blocks (the detector's position for you can be ~2 off).
+local function learnSelf(dists)
+  if SELF.name then return end
+  local best, bd
+  for n, d in pairs(dists) do
+    if type(n) == "string" and d and (not bd or d < bd) then best, bd = n, d end
+  end
+  if best and bd < 4 then setSelf(best) end
+end
 
 ---------------------------------------------------------------------
 -- 2. SMALL HELPERS
@@ -296,16 +315,36 @@ end
 ---------------------------------------------------------------------
 -- 5. HUD  (panel, alert banner, 3D markers)
 ---------------------------------------------------------------------
-local HUD = { shown = true, parts = {}, markers = {}, alertUntil = 0 }
-local ROWS = {
-  { key = "card",     label = "Card"     },
-  { key = "inv",      label = "Inventory"},
-  { key = "losses",   label = "Losses"   },
-  { key = "managers", label = "Managers" },
-  { key = "nearby",   label = "Nearby"   },
-  { key = "last",     label = "Last"     },
+local HUD = { shown = true, parts = {}, markers = {}, alertUntil = 0,
+              contacts = {}, toast = {}, started = 0 }
+
+-- Screen layout ------------------------------------------------------
+-- Positions are in overlay text units. getGuiSize() may report raw pixels
+-- or GUI-scaled units depending on the build, so big raw-looking numbers
+-- get divided by the scale. Override with:  uiwidth 640 360
+local LAYOUT = { W = 480, H = 270 }
+function LAYOUT.compute()
+  local w, h, sc
+  if HW.overlay then w, h, sc = try(HW.overlay.getGuiSize) end
+  LAYOUT.raw = { w, h, sc }
+  if w and sc and sc > 1 and w >= 900 then w, h = w / sc, h / sc end
+  LAYOUT.W, LAYOUT.H = w or 480, h or 270
+  if fs.exists("/.glasses_screen") then
+    local f = fs.open("/.glasses_screen", "r")
+    local ow, oh = (f.readAll() or ""):match("(%d+)%s+(%d+)"); f.close()
+    if ow then LAYOUT.W, LAYOUT.H = tonumber(ow), tonumber(oh) end
+  end
+end
+
+-- Card geometry (shared look for every card)
+local CARD = { W = 152, HDR = 13, ROW = 12, PADY = 4 }
+local SROWS = {
+  { key = "card", label = "CARD" },
+  { key = "inv",  label = "INV"  },
+  { key = "loss", label = "LOSS" },
+  { key = "mgr",  label = "MGR"  },
+  { key = "up",   label = "UP"   },
 }
-local ROW_H, HEADER_H, PAD = 11, 15, 6
 local rowValues = {}
 
 local function removeObject(o)
@@ -336,59 +375,128 @@ local function setColor(obj, color)
   if obj and type(obj.setColor) == "function" then pcall(obj.setColor, color) end
 end
 
+-- A card: dark body, coloured header, accent edge, faint zebra rows.
+-- Returns the list of created objects.
+local function card(list, x, y, w, rows, title, accent)
+  local h = CARD.HDR + rows * CARD.ROW + CARD.PADY
+  list[#list + 1] = rect(x, y, w, h, COLOR.panel, 0.86)
+  list[#list + 1] = rect(x, y, w, CARD.HDR, COLOR.header, 0.95)
+  list[#list + 1] = rect(x, y, 2, h, accent or COLOR.accent, 1)
+  for i = 2, rows, 2 do
+    list[#list + 1] = rect(x + 2, y + CARD.HDR + 2 + (i - 1) * CARD.ROW, w - 2, CARD.ROW, 0xFFFFFF, 0.05)
+  end
+  list[#list + 1] = text(x + 7, y + 3, title, accent or COLOR.accent)
+  return h
+end
+local function rowY(y, i) return y + CARD.HDR + 4 + (i - 1) * CARD.ROW end
+
+-- Top-left: evidence status card
 function HUD.build()
   if not HW.overlay then return end
-  local P = HUD.parts
-  local x, y, w = SETTINGS.HUD_X, SETTINGS.HUD_Y, SETTINGS.HUD_WIDTH
-  local h = HEADER_H + #ROWS * ROW_H + PAD
-  -- order matters: backgrounds first, text on top
-  P.bg       = rect(x, y, w, h, COLOR.panel, 0.72)
-  P.header   = rect(x, y, w, HEADER_H, COLOR.header, 0.9)
-  P.stripe   = rect(x, y + HEADER_H, w, 1, COLOR.accent, 1)
-  P.title    = text(x + PAD, y + 4, "EVIDENCE LOG", COLOR.accent)
-  P.dot      = text(x + w - 40, y + 4, "* REC", COLOR.bad)
-  for i, row in ipairs(ROWS) do
-    local ry = y + HEADER_H + 4 + (i - 1) * ROW_H
-    P["l_" .. row.key] = text(x + PAD, ry, row.label, COLOR.label)
-    P["v_" .. row.key] = text(x + 70, ry, rowValues[row.key] and rowValues[row.key][1] or "-",
+  LAYOUT.compute()
+  local P, list = HUD.parts, {}
+  local x, y = 4, 4
+  HUD.statusH = card(list, x, y, CARD.W, #SROWS, "EVIDENCE", COLOR.accent)
+  for i, o in ipairs(list) do P["c" .. i] = o end
+  P.dot = text(x + CARD.W - 24, y + 3, "REC", COLOR.bad)
+  for i, row in ipairs(SROWS) do
+    P["l_" .. row.key] = text(x + 7, rowY(y, i), row.label, COLOR.label)
+    P["v_" .. row.key] = text(x + 40, rowY(y, i), rowValues[row.key] and rowValues[row.key][1] or "-",
                              rowValues[row.key] and rowValues[row.key][2] or COLOR.text)
   end
+  HUD.contactsKey = nil   -- force contacts redraw
 end
+function HUD.leftBottom() return 4 + (HUD.statusH or 77) + 6 end
 
--- Update one row's value (and its colour).
 function HUD.row(key, value, color)
-  value = shorten(value, 26)
+  value = shorten(value, 17)
   rowValues[key] = { value, color or COLOR.text }
   local obj = HUD.parts["v_" .. key]
-  if obj then
-    setText(obj, value)
-    setColor(obj, color or COLOR.text)
-  end
+  if obj then setText(obj, value); setColor(obj, color or COLOR.text) end
 end
 
--- Red banner under the panel for important events.
+-- Top-right: contacts (nearby players, arrow = which way to turn)
+-- list: { { name, dist, arrow, ally }, ... }
+function HUD.drawContacts(list)
+  if not HW.overlay then return end
+  local key = {}
+  for _, c in ipairs(list) do key[#key + 1] = c.name .. c.arrow .. math.floor(c.dist or -1) end
+  key = table.concat(key, "|") .. (HUD.shown and "1" or "0")
+  if key == HUD.contactsKey then return end      -- nothing changed, don't redraw
+  HUD.contactsKey = key
+  try(HW.overlay.setAutoUpdate, false)
+  for _, o in ipairs(HUD.contacts) do removeObject(o) end
+  HUD.contacts = {}
+  if HUD.shown then
+    local W = 132
+    local x, y = LAYOUT.W - W - 4, 4
+    local n = math.min(#list, 6)
+    local hostile = 0
+    for _, c in ipairs(list) do if not c.ally then hostile = hostile + 1 end end
+    local accent = hostile > 0 and COLOR.bad or COLOR.good
+    card(HUD.contacts, x, y, W, math.max(n, 1), "CONTACTS", accent)
+    local cnt = tostring(#list)
+    HUD.contacts[#HUD.contacts + 1] = text(x + W - 6 - #cnt * 6, y + 3, cnt, accent)
+    if n == 0 then
+      HUD.contacts[#HUD.contacts + 1] = text(x + 7, rowY(y, 1), "all clear", COLOR.label)
+    end
+    for i = 1, n do
+      local c = list[i]
+      local col = c.ally and COLOR.good or COLOR.warn
+      if not c.ally and c.dist and c.dist <= SETTINGS.ALERT_RANGE then col = COLOR.bad end
+      local d = c.dist and (math.floor(c.dist) .. "m") or "?"
+      HUD.contacts[#HUD.contacts + 1] = text(x + 7, rowY(y, i), c.arrow, col)
+      HUD.contacts[#HUD.contacts + 1] = text(x + 17, rowY(y, i), shorten(c.name, 13), col)
+      HUD.contacts[#HUD.contacts + 1] = text(x + W - 6 - #d * 6, rowY(y, i), d, COLOR.text)
+    end
+  end
+  try(HW.overlay.update); try(HW.overlay.setAutoUpdate, true)
+end
+
+-- Top-centre toast (one at a time, sized to the message)
 function HUD.alert(message, color)
   HUD.alertUntil = nowMs() + SETTINGS.ALERT_SECONDS * 1000
-  if not HW.overlay or not HUD.shown then return end
-  removeObject(HUD.parts.alertBg); removeObject(HUD.parts.alertText)
-  local x = SETTINGS.HUD_X
-  local y = SETTINGS.HUD_Y + HEADER_H + #ROWS * ROW_H + PAD + 4
-  HUD.parts.alertBg   = rect(x, y, SETTINGS.HUD_WIDTH, 14, color or COLOR.bad, 0.85)
-  HUD.parts.alertText = text(x + PAD, y + 3, shorten(message, 38), 0xFFFFFF)
+  if not HW.overlay then return end
+  try(HW.overlay.setAutoUpdate, false)
+  for _, o in ipairs(HUD.toast) do removeObject(o) end
+  HUD.toast = {}
+  if HUD.shown then
+    -- fit between the left cards and the contacts card: wrap to <= 2 lines
+    local maxChars = math.max(16, math.floor((LAYOUT.W - 2 * (CARD.W + 14) - 16) / 6))
+    local lines, cur = {}, ""
+    for word in tostring(message):gmatch("%S+") do
+      if #cur == 0 then cur = word
+      elseif #cur + 1 + #word <= maxChars then cur = cur .. " " .. word
+      else lines[#lines + 1] = cur; cur = word end
+    end
+    if #cur > 0 then lines[#lines + 1] = cur end
+    if #lines > 2 then lines = { lines[1], shorten(table.concat(lines, " ", 2), maxChars) } end
+    for i, l in ipairs(lines) do lines[i] = shorten(l, maxChars) end
+    local longest = 0
+    for _, l in ipairs(lines) do longest = math.max(longest, #l) end
+    local w, h = longest * 6 + 16, #lines * 10 + 6
+    local x, y = LAYOUT.W / 2 - w / 2, 36
+    color = color or COLOR.bad
+    HUD.toast[#HUD.toast + 1] = rect(x, y, w, h, COLOR.panel, 0.9)
+    HUD.toast[#HUD.toast + 1] = rect(x, y, 3, h, color, 1)
+    HUD.toast[#HUD.toast + 1] = rect(x, y + h - 1, w, 1, color, 1)
+    for i, l in ipairs(lines) do
+      HUD.toast[#HUD.toast + 1] = text(x + 9, y + 4 + (i - 1) * 10, l, color)
+    end
+  end
+  try(HW.overlay.update); try(HW.overlay.setAutoUpdate, true)
 end
 
 function HUD.tick()
-  if HUD.parts.alertBg and nowMs() > HUD.alertUntil then
-    removeObject(HUD.parts.alertBg); removeObject(HUD.parts.alertText)
-    HUD.parts.alertBg, HUD.parts.alertText = nil, nil
+  if #HUD.toast > 0 and nowMs() > HUD.alertUntil then
+    for _, o in ipairs(HUD.toast) do removeObject(o) end
+    HUD.toast = {}
   end
-  -- blink the REC dot
   if HUD.parts.dot then
-    setText(HUD.parts.dot, (math.floor(nowMs() / 700) % 2 == 0) and "* REC" or "  REC")
+    setText(HUD.parts.dot, (math.floor(nowMs() / 700) % 2 == 0) and "REC" or "")
   end
 end
 
--- 3D marker: soft outer glow + solid core + floating label, through walls.
 local function markerBoxes(x, y, z, distance)
   local list = {}
   local function box(size, color, opacity)
@@ -431,7 +539,7 @@ function HUD.setMarkers(found)   -- found: key -> {x,y,z,dist}
 end
 
 function HUD.objectCount()
-  local n = 0
+  local n = #HUD.contacts + #HUD.toast
   for _, o in pairs(HUD.parts) do if o then n = n + 1 end end
   for _, objs in pairs(HUD.markers) do n = n + #objs end
   return n
@@ -439,12 +547,15 @@ end
 
 function HUD.rebuild()
   if not HW.overlay then return end
-  -- remove only our own objects, so the HUD toolkit's stay put
+  -- remove only our own objects, so the toolkit's stay put
   try(HW.overlay.setAutoUpdate, false)
   for _, o in pairs(HUD.parts) do removeObject(o) end
   for _, objs in pairs(HUD.markers) do for _, o in ipairs(objs) do removeObject(o) end end
+  for _, o in ipairs(HUD.contacts) do removeObject(o) end
+  for _, o in ipairs(HUD.toast) do removeObject(o) end
   try(HW.overlay.update); try(HW.overlay.setAutoUpdate, true)
-  HUD.parts, HUD.markers = {}, {}
+  HUD.parts, HUD.markers, HUD.contacts, HUD.toast = {}, {}, {}, {}
+  HUD.contactsKey = nil
   if HUD.shown then HUD.build() end
 end
 
@@ -527,13 +638,12 @@ end
 
 local playerState = {}   -- name -> "near" once alerted, cleared when they leave
 local playerDist = {}    -- name -> metres (last poll)
+local playerPos = {}     -- name -> {x, z}
 
-local function isSelf(name, dist)
+local function isSelf(name)
   if type(name) ~= "string" then return true end
   local me = myName()
-  if me and name:lower() == me:lower() then return true end
-  if dist and dist < 1.5 then SELF.name = SELF.name or name; return true end
-  return false
+  return me ~= nil and name:lower() == me:lower()
 end
 
 local function checkPlayers()
@@ -548,16 +658,20 @@ local function checkPlayers()
     end
   end
   local x, y, z = myPosition()
-  local seenNow = {}
+  local seenNow, dists = {}, {}
   for _, n in ipairs(names) do
-    local dist
     if HW.detector and x and type(n) == "string" then
       local p = try(HW.detector.getPlayer, n)
       if type(p) == "table" and p.x then
-        dist = math.sqrt((p.x - x) ^ 2 + (p.y - y) ^ 2 + (p.z - z) ^ 2)
+        dists[n] = math.sqrt((p.x - x) ^ 2 + (p.y - y) ^ 2 + (p.z - z) ^ 2)
+        playerPos[n] = { x = p.x, z = p.z }
       end
     end
-    if not isSelf(n, dist) then
+  end
+  learnSelf(dists)
+  for _, n in ipairs(names) do
+    local dist = dists[n]
+    if not isSelf(n) then
       recentPlayers[n] = nowMs()
       playerDist[n] = dist
       seenNow[n] = true
@@ -743,41 +857,61 @@ local function refreshRows()
   local me, card = myName(), managerOwner()
   if RELAY.ok and relayFresh() then
     local rc = RELAY.latest.owner
-    if rc and me and rc ~= me then
-      HUD.row("card", "relay bound to " .. rc .. "!", COLOR.bad)
-    else
-      HUD.row("card", "relay " .. tostring(rc) .. "  secure", COLOR.good)
-    end
+    if rc and me and rc ~= me then HUD.row("card", "relay: " .. rc .. "!", COLOR.bad)
+    else HUD.row("card", "relay secure", COLOR.good) end
   elseif RELAY.ok then
-    HUD.row("card", RELAY.latest and "relay lost" or "relay silent", COLOR.warn)
+    HUD.row("card", RELAY.latest and "relay lost" or "relay off", COLOR.label)
   elseif not HW.manager then
-    HUD.row("card", "no manager", COLOR.warn)
+    HUD.row("card", "none", COLOR.label)
   elseif not card then
-    HUD.row("card", "no card / not bound", COLOR.bad)
+    HUD.row("card", "not bound", COLOR.bad)
   elseif me and card ~= me then
-    HUD.row("card", "bound to " .. card .. "!", COLOR.bad)
+    HUD.row("card", card .. "!", COLOR.bad)
   else
-    HUD.row("card", card .. "  OK", COLOR.good)
+    HUD.row("card", card .. " ok", COLOR.good)
   end
 
-  HUD.row("inv", invSource == "none" and "can't read" or ("via " .. invSource .. "  " .. (beforeTotal or 0) .. " items"),
+  HUD.row("inv", invSource == "none" and "can't read" or ((beforeTotal or 0) .. " items"),
           invSource == "none" and COLOR.bad or COLOR.good)
-  HUD.row("losses", ("%d   suspect %d"):format(stats.losses, stats.suspect),
+  HUD.row("loss", stats.suspect > 0 and (stats.losses .. "  SUSPECT " .. stats.suspect) or tostring(stats.losses),
           stats.suspect > 0 and COLOR.bad or (stats.losses > 0 and COLOR.warn or COLOR.text))
 
-  local mc = 0
-  for _ in pairs(currentManagers) do mc = mc + 1 end
-  HUD.row("managers", HW.scanner and (mc .. " here   " .. stats.managers .. " known") or "no geo scanner",
-          mc > 0 and COLOR.bad or (HW.scanner and COLOR.text or COLOR.warn))
-
-  local near, parts = nearbyList(), {}
-  for _, n in ipairs(near) do
-    local d = playerDist[n]
-    parts[#parts + 1] = n .. (d and (" " .. math.floor(d) .. "m") or "")
+  -- managers: how many here + nearest one's distance and direction
+  local mc, nearest = 0, nil
+  for _, m in pairs(currentManagers) do
+    mc = mc + 1
+    if not nearest or m.dist < nearest.dist then nearest = m end
   end
-  HUD.row("nearby", #parts > 0 and table.concat(parts, ", ") or "nobody",
-          #parts > 0 and COLOR.warn or COLOR.label)
-  HUD.row("last", lastEvent, COLOR.text)
+  local w = wearer()
+  local yaw = w and w.yaw
+  local x, _, z = myPosition()
+  local function arrowTo(tx, tz)
+    if not (yaw and x) then return "" end
+    local bearing = (math.deg((math.atan2 or math.atan)(-(tx - x), tz - z)) + 360) % 360
+    local rel = (bearing - yaw + 540) % 360 - 180
+    if math.abs(rel) < 30 then return "^" elseif math.abs(rel) > 150 then return "v" end
+    return rel > 0 and ">" or "<"
+  end
+  if not HW.scanner then
+    HUD.row("mgr", "no scanner", COLOR.label)
+  elseif nearest then
+    HUD.row("mgr", ("%d here %dm %s"):format(mc, math.floor(nearest.dist), arrowTo(nearest.x + 0.5, nearest.z + 0.5)), COLOR.bad)
+  else
+    HUD.row("mgr", stats.managers .. " known", COLOR.text)
+  end
+
+  local up = math.floor((nowMs() - HUD.started) / 1000)
+  HUD.row("up", ("%dh %02dm  marks %d"):format(math.floor(up / 3600), math.floor(up / 60) % 60, stats.marks), COLOR.label)
+
+  -- contacts card
+  local list = {}
+  for _, n in ipairs(nearbyList()) do
+    local p = playerPos[n]
+    list[#list + 1] = { name = n, dist = playerDist[n], ally = allies[n:lower()] == true,
+                        arrow = p and arrowTo(p.x, p.z) or "?" }
+  end
+  table.sort(list, function(a, b) return (a.dist or 1e9) < (b.dist or 1e9) end)
+  HUD.drawContacts(list)
 end
 
 ---------------------------------------------------------------------
@@ -1045,7 +1179,7 @@ local function HUD_TOOLKIT(...)
   ---------------------------------------------------------------------
   -- HUD panel
   ---------------------------------------------------------------------
-  local PANEL_X, PANEL_Y, PANEL_W = 6, 6, 250
+  local PANEL_X, PANEL_Y, PANEL_W = 4, 87, 152
 
   local function text(x, y, content, color)
     return try(overlay.createText, { gui = true, x = x, y = y, content = content, color = color, shadow = true })
@@ -1055,25 +1189,30 @@ local function HUD_TOOLKIT(...)
       sizeX = w * UI.rectX, sizeY = h, color = color, opacity = opacity })
   end
 
+  -- Left side: NAV card.  Top centre: compass bar.
+  local COMPASS_W = 160
   local function buildHud()
     for _, o in pairs(hud) do removeObj(o) end
     hud = {}
     if not hudShown then return end
     local x, y, w = PANEL_X, PANEL_Y, PANEL_W
-    hud.bg      = rect(x, y, w, 76, COLOR.panel, 0.72)
-    hud.bar     = rect(x, y, w, 14, COLOR.bar, 0.9)
-    hud.stripe  = rect(x, y + 14, w, 1, COLOR.accent, 1)
-    hud.title   = text(x + 6, y + 3, "HUD", COLOR.accent)
-    hud.clock   = text(x + w - 46, y + 3, "", COLOR.label)
-    hud.compass = text(x + 6, y + 19, "", COLOR.accent)
-    hud.pos     = text(x + 6, y + 30, "", COLOR.text)
-    hud.vitals  = text(x + 6, y + 41, "", COLOR.text)
-    hud.nav     = text(x + 6, y + 52, "", COLOR.nav)
-    hud.msg     = text(x + 6, y + 63, "type 'help' on the glasses", COLOR.label)
+    local list = {}
+    card(list, x, y, w, 4, "NAV", COLOR.accent)
+    for i, o in ipairs(list) do hud["c" .. i] = o end
+    hud.clock = text(x + w - 34, y + 3, "", COLOR.label)
+    for i, l in ipairs({ "POS", "FACE", "SPD", "MODE" }) do hud["l" .. i] = text(x + 7, rowY(y, i), l, COLOR.label) end
+    hud.pos  = text(x + 40, rowY(y, 1), "", COLOR.text)
+    hud.face = text(x + 40, rowY(y, 2), "", COLOR.text)
+    hud.spd  = text(x + 40, rowY(y, 3), "", COLOR.text)
+    hud.mode = text(x + 40, rowY(y, 4), "", COLOR.text)
+    -- compass bar
+    local cx = LAYOUT.W / 2
+    hud.cbg   = rect(cx - COMPASS_W / 2, 4, COMPASS_W, 15, COLOR.panel, 0.86)
+    hud.cline = rect(cx - COMPASS_W / 2, 18, COMPASS_W, 1, COLOR.accent, 1)
+    hud.notch = rect(cx - 0.5, 19, 1, 4, 0xFFFFFF, 1)
   end
 
-  -- Panel is PANEL_W wide; at ~6px/char that's room for ~ (PANEL_W/6 - 2) chars.
-  local LINE_CHARS = math.floor(PANEL_W / 6) - 2
+  local LINE_CHARS = 17
   local function set(obj, content, color)
     if not obj then return end
     if type(content) == "string" then content = shorten(content, LINE_CHARS) end
@@ -1081,10 +1220,9 @@ local function HUD_TOOLKIT(...)
     if color and obj.setColor then pcall(obj.setColor, color) end
   end
 
-  local msgUntil = 0
+  -- Feedback goes to the shared toast + the terminal log
   local function say(s, color)
-    set(hud.msg, s, color or COLOR.text)
-    msgUntil = os.epoch("utc") + 8000
+    HUD.alert(s, color or COLOR.accent)
     out(s)
     return true
   end
@@ -1118,28 +1256,51 @@ local function HUD_TOOLKIT(...)
     return ("%s %s %d"):format(arrow, side, math.floor(a + 0.5))
   end
 
-  -- Compass tape: 180 degrees centred on where you look.
-  -- N E S W letters, + for diagonals, * = your waypoint, | = straight ahead.
   local function bearingTo(dx, dz) return (math.deg(atan2(-dx, dz)) + 360) % 360 end
-  local function compassStrip(yaw, navBearing)
-    local N, step = 25, 7.5
-    local c = {}
-    for i = 1, N do c[i] = ((i - 1) % 2 == 0) and "." or " " end
-    local function place(a, ch)
-      local rel = (a - yaw + 540) % 360 - 180
-      if math.abs(rel) <= 90 then
-        local i = math.floor((rel + 90) / step + 0.5) + 1
-        if i >= 1 and i <= N then c[i] = ch end
+
+  -- Compass: each letter is its own text at an exact x (Minecraft's font is
+  -- proportional, so one text line can't line up). Waypoint = gold *,
+  -- with its name + distance just under the bar.
+  local compassObjs = {}
+  local function clearCompass()
+    for _, o in ipairs(compassObjs) do removeObj(o) end
+    compassObjs = {}
+  end
+  local function drawCompass(yaw, navBearing, navLabel, lowHp)
+    try(overlay.setAutoUpdate, false)
+    clearCompass()
+    if hudShown and yaw then
+      local cx, y0 = LAYOUT.W / 2, 8
+      local half = COMPASS_W / 2 - 10
+      local function put(a, label, color)
+        local rel = (a - yaw + 540) % 360 - 180
+        if math.abs(rel) <= 90 then
+          compassObjs[#compassObjs + 1] = try(overlay.createText, {
+            gui = true, x = cx + rel / 90 * half - #label * 3, y = y0, content = label, color = color, shadow = true })
+        end
+      end
+      for a = 0, 345, 15 do
+        if a % 45 ~= 0 then put(a, ".", COLOR.label) end
+      end
+      for _, m in ipairs({ { 45, "SW" }, { 135, "NW" }, { 225, "NE" }, { 315, "SE" } }) do put(m[1], m[2], COLOR.label) end
+      for _, m in ipairs({ { 0, "S" }, { 90, "W" }, { 180, "N" }, { 270, "E" } }) do put(m[1], m[2], COLOR.text) end
+      if navBearing then
+        -- gold tick under the bar (never covers a letter); clamps to the edge
+        local rel = (navBearing - yaw + 540) % 360 - 180
+        local px = cx + math.max(-1, math.min(1, rel / 90)) * half
+        compassObjs[#compassObjs + 1] = rect(px - 1.5, 17, 3, 6, COLOR.waypoint, 1)
+      end
+      if navLabel then
+        compassObjs[#compassObjs + 1] = try(overlay.createText, {
+          gui = true, x = cx - #navLabel * 3, y = 24, content = navLabel, color = COLOR.waypoint, shadow = true })
       end
     end
-    for _, m in ipairs({ { 45, "+" }, { 135, "+" }, { 225, "+" }, { 315, "+" },
-                         { 0, "S" }, { 90, "W" }, { 180, "N" }, { 270, "E" } }) do
-      place(m[1], m[2])
+    if hudShown and lowHp and math.floor(os.epoch("utc") / 400) % 2 == 0 then
+      local s = "! LOW HP " .. lowHp .. " !"
+      compassObjs[#compassObjs + 1] = try(overlay.createText, {
+        gui = true, x = LAYOUT.W / 2 - #s * 3, y = LAYOUT.H / 2 + 14, content = s, color = COLOR.bad, shadow = true })
     end
-    if navBearing then place(navBearing, "*") end
-    local mid = math.floor(N / 2) + 1
-    if c[mid] == "." or c[mid] == " " then c[mid] = "|" end
-    return table.concat(c)
+    try(overlay.update); try(overlay.setAutoUpdate, true)
   end
 
   ---------------------------------------------------------------------
@@ -1254,19 +1415,25 @@ local function HUD_TOOLKIT(...)
     clearGroup("players")
     nearbyNames = {}
     if not detector then return end
-    local myName = me().name or SELF.name
     local fx, fy, fz = myPos()
+    local found, dists = {}, {}
     for _, p in pairs(try(detector.getPlayersInRange, PLAYER_RANGE) or {}) do
       local name = type(p) == "table" and p.name or p
-      local info = type(name) == "string" and try(detector.getPlayer, name) or nil
-      local exact
-      if type(info) == "table" and info.x and fx then
-        exact = math.sqrt((info.x - fx) ^ 2 + (info.y - fy) ^ 2 + (info.z - fz) ^ 2)
+      if type(name) == "string" then
+        local info = try(detector.getPlayer, name)
+        local exact
+        if type(info) == "table" and info.x and fx then
+          exact = math.sqrt((info.x - fx) ^ 2 + (info.y - fy) ^ 2 + (info.z - fz) ^ 2)
+        end
+        found[#found + 1] = { name = name, info = info, exact = exact }
+        dists[name] = exact
       end
-      local isMe = type(name) ~= "string"
-        or (myName and name:lower() == myName:lower())
-        or (exact and exact < 1.5)
-      if isMe and type(name) == "string" and not SELF.name then SELF.name = name end
+    end
+    learnSelf(dists)
+    local myName = me().name or SELF.name
+    for _, f in ipairs(found) do
+      local name, info, exact = f.name, f.info, f.exact
+      local isMe = myName and name:lower() == myName:lower()
       if not isMe then
         local dist = exact and math.floor(exact + 0.5) or "?"
         nearbyNames[#nearbyNames + 1] = name .. " " .. dist .. "m"
@@ -1307,6 +1474,7 @@ local function HUD_TOOLKIT(...)
   -- Remove only OUR objects, so other programs' overlays stay put.
   local function removeAllOwn()
     try(overlay.setAutoUpdate, false)
+    clearCompass()
     if dimObj then removeObj(dimObj) end
     for _, o in pairs(hud) do removeObj(o) end
     for _, g in pairs(groups) do
@@ -1462,58 +1630,62 @@ local function HUD_TOOLKIT(...)
   ---------------------------------------------------------------------
   -- Loops
   ---------------------------------------------------------------------
-  local lastPos       -- for teleport / respawn detection
+  local lastPos       -- for teleport / respawn detection + speed
+  local speed = 0
   local function infoLoop()
     while true do
       if hudShown then
         if countObjects() > (try(overlay.getObjectsCount) or 1e9) then rebuildAll() end
         local o = me()
         local x, y, z = myPos()
+        local t = os.epoch("utc")
 
-        -- auto "back" waypoint: a sudden jump of 100+ blocks (teleport,
-        -- respawn, long pearl) saves where you were just before it
         if x then
-          if lastPos and ((x - lastPos.x) ^ 2 + (z - lastPos.z) ^ 2) > 100 * 100 then
-            waypoints.back = { x = math.floor(lastPos.x), y = math.floor(lastPos.y), z = math.floor(lastPos.z) }
-            saveWaypoints()
-            say("jump! 'wp go back' returns", COLOR.warn)
+          if lastPos then
+            local d2 = (x - lastPos.x) ^ 2 + (z - lastPos.z) ^ 2
+            if d2 > 100 * 100 then
+              -- teleport / respawn / long pearl: remember where you were
+              waypoints.back = { x = math.floor(lastPos.x), y = math.floor(lastPos.y), z = math.floor(lastPos.z) }
+              saveWaypoints()
+              say("jumped! 'wp go back' returns", COLOR.warn)
+            else
+              local dt = (t - lastPos.t) / 1000
+              if dt > 0 then speed = speed * 0.5 + (math.sqrt(d2) / dt) * 0.5 end
+            end
           end
-          lastPos = { x = x, y = y, z = z }
+          lastPos = { x = x, y = y, z = z, t = t }
         end
 
-        local navBearing
-        if navTarget and x then navBearing = bearingTo(navTarget.x + 0.5 - x, navTarget.z + 0.5 - z) end
-        if o.yaw then set(hud.compass, compassStrip(o.yaw, navBearing)) end
-
-        if x then
-          set(hud.pos, ("%d %d %d  facing %s"):format(math.floor(x), math.floor(y), math.floor(z),
-              o.yaw and facingName(o.yaw) or "?"))
-        end
-        local low = o.health and o.health <= 6
-        local hp = (o.health and o.maxHealth) and ("HP %d/%d"):format(math.floor(o.health), math.floor(o.maxHealth)) or "HP ?"
-        if low then hp = hp .. " LOW!" end
-        local act = {}
-        if blockTargets then act[#act + 1] = "blocks" end
-        if showPlayers then act[#act + 1] = "players" end
-        if dark then act[#act + 1] = "dark" end
-        set(hud.vitals, hp .. "  " .. (#act > 0 and table.concat(act, "+") or "idle"),
-            low and COLOR.bad or COLOR.text)
-        set(hud.clock, textutils.formatTime(os.time(), true))
+        local navBearing, navLabel
         if navTarget and x then
           local dx, dz = navTarget.x + 0.5 - x, navTarget.z + 0.5 - z
           local dist = math.floor(math.sqrt(dx * dx + dz * dz + (navTarget.y - y) ^ 2) + 0.5)
           local dy = navTarget.y - math.floor(y)
-          local height = dy > 1 and (" up " .. dy) or (dy < -1 and (" down " .. -dy) or "")
           if dist <= 2 then
             say("arrived at " .. navTarget.name, COLOR.good)
-            navTarget = nil; clearGroup("waypoint"); set(hud.nav, "")
+            navTarget = nil; clearGroup("waypoint")
           else
-            set(hud.nav, ("> %s %dm %s%s"):format(navTarget.name, dist, relativeDir(dx, dz, o.yaw), height))
+            navBearing = bearingTo(dx, dz)
+            navLabel = ("%s  %dm%s"):format(navTarget.name, dist,
+              dy > 1 and ("  +" .. dy) or (dy < -1 and ("  " .. dy) or ""))
           end
-        else
-          set(hud.nav, "")
         end
-        if os.epoch("utc") > msgUntil then set(hud.msg, "") end
+        local lowHp
+        if o.health and o.health <= 6 then lowHp = ("%d/%d"):format(math.floor(o.health), math.floor(o.maxHealth or 20)) end
+        drawCompass(o.yaw, navBearing, navLabel, lowHp)
+
+        if x then set(hud.pos, ("%d %d %d"):format(math.floor(x), math.floor(y), math.floor(z))) end
+        set(hud.face, o.yaw and ("%s  %d"):format(facingName(o.yaw), math.floor((o.yaw + 180) % 360)) or "?")
+        local dim = myDimension()
+        set(hud.spd, ("%.1f b/s%s"):format(speed, dim ~= "?" and ("  " .. plainName(dim)) or ""),
+            speed > 12 and COLOR.warn or COLOR.text)
+        local act = {}
+        if blockTargets then act[#act + 1] = "blocks" end
+        if showPlayers then act[#act + 1] = "players" end
+        if dark then act[#act + 1] = "dark" end
+        if navTarget then act[#act + 1] = "nav" end
+        set(hud.mode, #act > 0 and table.concat(act, "+") or "idle", #act > 0 and COLOR.good or COLOR.label)
+        set(hud.clock, textutils.formatTime(os.time(), true))
       end
       sleep(INFO_EVERY)
     end
@@ -1603,7 +1775,10 @@ local LOG_HELP = {
   "summary    counts",
   "managers   list known",
   "ally add/del/list <n>",
-  "uiscale <n> fix boxes",
+  "me <name>  set your name",
+  "uiscale <n> box width",
+  "uiwidth <w> <h> screen",
+  "uiinfo     screen info",
   "hide       hide all",
   "q          quit",
 }
@@ -1677,6 +1852,9 @@ local function inputLoop()
     elseif cmd == "mark" or cmd == "m" then mark("typed")
     elseif cmd == "summary" or cmd == "s" then summary()
     elseif cmd == "managers" or cmd == "mgrs" then listManagers()
+    elseif cmd == "me" then
+      if words[2] then setSelf(words[2]); out("you are " .. words[2], colours.lime)
+      else out("you are " .. tostring(myName() or "unknown")) end
     elseif cmd == "ally" then
       local sub, name = (words[2] or ""):lower(), words[3]
       if sub == "add" and name then allies[name:lower()] = true; saveAllies(); out("ally: " .. name, colours.lime)
@@ -1700,6 +1878,20 @@ local function inputLoop()
         out("boxes too narrow: raise")
         out("boxes too wide: lower")
       end
+    elseif cmd == "uiinfo" then
+      LAYOUT.compute()
+      local r = LAYOUT.raw or {}
+      out(("gui: %s x %s  scale %s"):format(tostring(r[1]), tostring(r[2]), tostring(r[3])))
+      out(("using %d x %d"):format(LAYOUT.W, LAYOUT.H))
+      out("box scale " .. UI.rectX)
+    elseif cmd == "uiwidth" then
+      local w, h = tonumber(words[2]), tonumber(words[3])
+      if w and h then
+        local f = fs.open("/.glasses_screen", "w"); f.write(w .. " " .. h); f.close()
+      elseif fs.exists("/.glasses_screen") then fs.delete("/.glasses_screen") end
+      HUD.rebuild()
+      if toolkit then toolkit.setShown(HUD.shown) end
+      out(w and ("screen set " .. w .. "x" .. h) or "screen: auto", colours.lime)
     elseif cmd == "hide" then
       HUD.shown = not HUD.shown; HUD.rebuild()
       if toolkit then toolkit.setShown(HUD.shown) end
@@ -1718,11 +1910,12 @@ end
 
 local function main()
   setupTerminal()
+  HUD.started = nowMs()
   HUD.rebuild()
   local loops = { run, inputLoop, statusLoop }
   if toolkit then
     -- put the toolkit's panel under ours (and under the alert banner)
-    toolkit.start({ panelY = SETTINGS.HUD_Y + HEADER_H + #ROWS * ROW_H + PAD + 24 })
+    toolkit.start({ panelY = HUD.leftBottom() })
     for _, l in ipairs(toolkit.loops) do loops[#loops + 1] = l end
   end
   out("Type 'help'. Hotkey = mark.", colours.lightGrey)
