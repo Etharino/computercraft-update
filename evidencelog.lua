@@ -106,17 +106,19 @@ local COLOR = {
   marker  = 0xFF3355, markerCore = 0xFFFFFF,
 }
 
--- Box sizes: the overlay places rectangles in GUI units (like text) but
--- SIZES them in raw pixels, so sizes get multiplied by your GUI scale.
--- Detected automatically; force with:  uiscale 2   (saved to /.glasses_box)
-local UI = { box = nil }
-if fs.exists("/.glasses_box") then
-  local f = fs.open("/.glasses_box", "r")
+-- HUD size. Overlay rectangles are drawn CENTRED on their x/y (rect()
+-- below converts from a top-left corner), and every size in the layout is
+-- multiplied by UI.size, with text drawn at fontSize = UI.size.
+-- Change it live with:  uisize 0.6   (saved to /.glasses_size)
+local UI = { size = 0.75 }
+if fs.exists("/.glasses_size") then
+  local f = fs.open("/.glasses_size", "r")
   local v = tonumber(f.readAll()); f.close()
-  if v and v > 0.2 and v < 9 then UI.box = v end
+  if v and v >= 0.4 and v <= 1.5 then UI.size = v end
 end
+local function U(n) return n * UI.size end
 local LAYOUT   -- set up in section 5
-local function boxScale() return UI.box or (LAYOUT and LAYOUT.scale) or 2 end
+
 
 -- Terminal output. Once the layout is up, lines go into the log window
 -- so they don't scroll the status bar or your typing away.
@@ -367,13 +369,16 @@ function LAYOUT.compute()
 end
 
 -- Card geometry (shared look for every card)
-local CARD = { W = 152, HDR = 13, ROW = 12, PADY = 4 }
+local CARD = {}
+function CARD.W() return U(150) end
+function CARD.HDR() return U(13) end
+function CARD.ROW() return U(11) end
+function CARD.PADY() return U(4) end
+
 local SROWS = {
   { key = "time",  label = "TIME"  },
   { key = "dist",  label = "DIST"  },
   { key = "items", label = "ITEMS" },
-  { key = "hp",    label = "HP"    },
-  { key = "seen",  label = "SEEN"  },
   { key = "ores",  label = "ORES"  },
   { key = "mgr",   label = "MGR"   },
 }
@@ -386,16 +391,17 @@ local function removeObject(o)
   end
 end
 
+-- Overlay rectangles are CENTRED on (x, y). This takes a top-left corner.
 local function rect(x, y, w, h, color, opacity)
   return try(HW.overlay.createRectangle, {
-    gui = true, x = x, y = y, sizeX = w * boxScale(), sizeY = h * boxScale(),
+    gui = true, x = x + w / 2, y = y + h / 2, sizeX = w, sizeY = h,
     color = color, opacity = opacity,
   })
 end
 
 local function text(x, y, content, color)
   return try(HW.overlay.createText, {
-    gui = true, x = x, y = y, content = content, color = color, shadow = true,
+    gui = true, x = x, y = y, content = content, color = color, shadow = true, fontSize = UI.size,
   })
 end
 
@@ -408,19 +414,18 @@ local function setColor(obj, color)
 end
 
 -- A card: dark body, coloured header, accent edge, faint zebra rows.
--- Returns the list of created objects.
 local function card(list, x, y, w, rows, title, accent)
-  local h = CARD.HDR + rows * CARD.ROW + CARD.PADY
-  list[#list + 1] = rect(x, y, w, h, COLOR.panel, 0.86)
-  list[#list + 1] = rect(x, y, w, CARD.HDR, COLOR.header, 0.95)
-  list[#list + 1] = rect(x, y, 2, h, accent or COLOR.accent, 1)
+  local h = CARD.HDR() + rows * CARD.ROW() + CARD.PADY()
+  list[#list + 1] = rect(x, y, w, h, COLOR.panel, 0.82)
+  list[#list + 1] = rect(x, y, w, CARD.HDR(), COLOR.header, 0.92)
+  list[#list + 1] = rect(x, y, U(2), h, accent or COLOR.accent, 1)
   for i = 2, rows, 2 do
-    list[#list + 1] = rect(x + 2, y + CARD.HDR + 2 + (i - 1) * CARD.ROW, w - 2, CARD.ROW, 0xFFFFFF, 0.05)
+    list[#list + 1] = rect(x + U(2), y + CARD.HDR() + U(1.5) + (i - 1) * CARD.ROW(), w - U(2), CARD.ROW(), 0xFFFFFF, 0.05)
   end
-  list[#list + 1] = text(x + 7, y + 3, title, accent or COLOR.accent)
+  list[#list + 1] = text(x + U(7), y + U(3), title, accent or COLOR.accent)
   return h
 end
-local function rowY(y, i) return y + CARD.HDR + 4 + (i - 1) * CARD.ROW end
+local function rowY(y, i) return y + CARD.HDR() + U(3) + (i - 1) * CARD.ROW() end
 
 -- Moving an existing object: overlay objects animate from x=0 when they
 -- are CREATED, so everything that changes is created once and then moved
@@ -432,43 +437,43 @@ local function moveX(obj, x)
   return false
 end
 
-local NAV_H = CARD.HDR + 4 * CARD.ROW + CARD.PADY
-local CONTACT_ROWS = 5
+local function NAV_H() return CARD.HDR() + 4 * CARD.ROW() + CARD.PADY() end
+local CONTACT_ROWS = 4
 
--- Left column: EVIDENCE card, then NAV (toolkit), then CONTACTS.
+-- Left column: STATS card, then NAV (toolkit), then CONTACTS.
 function HUD.build()
   if not HW.overlay then return end
   LAYOUT.compute()
   local P, list = HUD.parts, {}
-  local x, y = 4, 4
-  HUD.statusH = card(list, x, y, CARD.W, #SROWS, "STATS", COLOR.accent)
+  local x, y, W = U(4), U(4), CARD.W()
+  HUD.statusH = card(list, x, y, W, #SROWS, "STATS", COLOR.accent)
   for i, o in ipairs(list) do P["c" .. i] = o end
-  if SETTINGS.EVIDENCE then P.dot = text(x + CARD.W - 24, y + 3, "REC", COLOR.bad) end
+  if SETTINGS.EVIDENCE then P.dot = text(x + W - U(24), y + U(3), "REC", COLOR.bad) end
   for i, row in ipairs(SROWS) do
-    P["l_" .. row.key] = text(x + 7, rowY(y, i), row.label, COLOR.label)
-    P["v_" .. row.key] = text(x + 44, rowY(y, i), rowValues[row.key] and rowValues[row.key][1] or "-",
+    P["l_" .. row.key] = text(x + U(7), rowY(y, i), row.label, COLOR.label)
+    P["v_" .. row.key] = text(x + U(44), rowY(y, i), rowValues[row.key] and rowValues[row.key][1] or "-",
                              rowValues[row.key] and rowValues[row.key][2] or COLOR.text)
   end
 
-  -- CONTACTS: fixed card with 5 rows; rows are re-texted, never recreated
-  local cy = 4 + HUD.statusH + 6 + NAV_H + 6
+  -- CONTACTS: fixed card; rows are re-texted, never recreated
+  local cy = y + HUD.statusH + U(5) + NAV_H() + U(5)
   local cl = {}
-  card(cl, x, cy, CARD.W, CONTACT_ROWS, "CONTACTS", COLOR.good)
+  card(cl, x, cy, W, CONTACT_ROWS, "CONTACTS", COLOR.good)
   HUD.cpool = { edge = cl[3], title = cl[#cl], rows = {} }
-  HUD.cpool.count = text(x + CARD.W - 18, cy + 3, "0", COLOR.good)
+  HUD.cpool.count = text(x + W - U(16), cy + U(3), "0", COLOR.good)
   cl[#cl + 1] = HUD.cpool.count
   for i = 1, CONTACT_ROWS do
     local r = {
-      arrow = text(x + 7, rowY(cy, i), "", COLOR.text),
-      name  = text(x + 17, rowY(cy, i), i == 1 and "all clear" or "", COLOR.label),
-      dist  = text(x + CARD.W - 34, rowY(cy, i), "", COLOR.text),
+      arrow = text(x + U(7), rowY(cy, i), "", COLOR.text),
+      name  = text(x + U(16), rowY(cy, i), i == 1 and "all clear" or "", COLOR.label),
+      dist  = text(x + W - U(32), rowY(cy, i), "", COLOR.text),
     }
     HUD.cpool.rows[i] = r
     cl[#cl + 1] = r.arrow; cl[#cl + 1] = r.name; cl[#cl + 1] = r.dist
   end
   HUD.contacts = cl
 end
-function HUD.leftBottom() return 4 + (HUD.statusH or 101) + 6 end
+function HUD.leftBottom() return U(4) + (HUD.statusH or U(72)) + U(5) end
 
 function HUD.row(key, value, color)
   value = shorten(value, 17)
@@ -505,7 +510,7 @@ function HUD.drawContacts(list)
   end
 end
 
--- Top-centre toast (one at a time, sized to the message)
+-- Toast just above the crosshair (one at a time, sized to the message)
 function HUD.alert(message, color)
   HUD.alertUntil = nowMs() + SETTINGS.ALERT_SECONDS * 1000
   if not HW.overlay then return end
@@ -513,8 +518,7 @@ function HUD.alert(message, color)
   for _, o in ipairs(HUD.toast) do removeObject(o) end
   HUD.toast = {}
   if HUD.shown then
-    -- fit between the left cards and the contacts card: wrap to <= 2 lines
-    local maxChars = math.max(16, math.floor((LAYOUT.W - 2 * (CARD.W + 14) - 16) / 6))
+    local maxChars = 30
     local lines, cur = {}, ""
     for word in tostring(message):gmatch("%S+") do
       if #cur == 0 then cur = word
@@ -526,14 +530,13 @@ function HUD.alert(message, color)
     for i, l in ipairs(lines) do lines[i] = shorten(l, maxChars) end
     local longest = 0
     for _, l in ipairs(lines) do longest = math.max(longest, #l) end
-    local w, h = longest * 6 + 16, #lines * 10 + 6
-    local x, y = LAYOUT.W / 2 - w / 2, LAYOUT.H / 2 - 30 - h
+    local w, h = longest * U(6) + U(14), #lines * U(10) + U(5)
+    local x, y = LAYOUT.W / 2 - w / 2, LAYOUT.H / 2 - 24 - h
     color = color or COLOR.bad
-    HUD.toast[#HUD.toast + 1] = rect(x, y, w, h, COLOR.panel, 0.9)
-    HUD.toast[#HUD.toast + 1] = rect(x, y, 3, h, color, 1)
-    HUD.toast[#HUD.toast + 1] = rect(x, y + h - 1, w, 1, color, 1)
+    HUD.toast[#HUD.toast + 1] = rect(x, y, w, h, COLOR.panel, 0.85)
+    HUD.toast[#HUD.toast + 1] = rect(x, y, U(2), h, color, 1)
     for i, l in ipairs(lines) do
-      HUD.toast[#HUD.toast + 1] = text(x + 9, y + 4 + (i - 1) * 10, l, color)
+      HUD.toast[#HUD.toast + 1] = text(x + U(7), y + U(3) + (i - 1) * U(10), l, color)
     end
   end
   try(HW.overlay.update); try(HW.overlay.setAutoUpdate, true)
@@ -1291,41 +1294,34 @@ local function HUD_TOOLKIT(...)
   ---------------------------------------------------------------------
   -- HUD panel
   ---------------------------------------------------------------------
-  local PANEL_X, PANEL_Y, PANEL_W = 4, 87, 152
+  local PANEL_X, PANEL_Y = U(4), 80
 
-  local function text(x, y, content, color)
-    return try(overlay.createText, { gui = true, x = x, y = y, content = content, color = color, shadow = true })
-  end
-  local function rect(x, y, w, h, color, opacity)
-    return try(overlay.createRectangle, { gui = true, x = x, y = y,
-      sizeX = w * boxScale(), sizeY = h * boxScale(), color = color, opacity = opacity })
-  end
-
-  -- Left side: NAV card.  Top centre: compass bar.
-  local COMPASS_W = 160
-  -- top of the compass bar: above armour/health/hotbar, below Jade's tooltip
-  local function compassY() return LAYOUT.H - 76 end
+  local COMPASS_W
+  -- compass bar sits above the armour/health/hotbar rows, below Jade's tooltip
+  local function barTop() return LAYOUT.H - 58 - U(15) end
   local buildCompass   -- defined with the compass code below
+
+  -- Left side: NAV card.  Bottom centre: compass bar.
   local function buildHud()
     for _, o in pairs(hud) do removeObj(o) end
     hud = {}
     if not hudShown then return end
-    local x, y, w = PANEL_X, PANEL_Y, PANEL_W
+    COMPASS_W = U(170)
+    local x, y, w = PANEL_X, PANEL_Y, CARD.W()
     local list = {}
     card(list, x, y, w, 4, "NAV", COLOR.accent)
     for i, o in ipairs(list) do hud["c" .. i] = o end
-    hud.clock = text(x + w - 34, y + 3, "", COLOR.label)
-    for i, l in ipairs({ "POS", "FACE", "SPD", "MODE" }) do hud["l" .. i] = text(x + 7, rowY(y, i), l, COLOR.label) end
-    hud.pos  = text(x + 40, rowY(y, 1), "", COLOR.text)
-    hud.face = text(x + 40, rowY(y, 2), "", COLOR.text)
-    hud.spd  = text(x + 40, rowY(y, 3), "", COLOR.text)
-    hud.mode = text(x + 40, rowY(y, 4), "", COLOR.text)
+    hud.clock = text(x + w - U(32), y + U(3), "", COLOR.label)
+    for i, l in ipairs({ "POS", "FACE", "SPD", "MODE" }) do hud["l" .. i] = text(x + U(7), rowY(y, i), l, COLOR.label) end
+    hud.pos  = text(x + U(44), rowY(y, 1), "", COLOR.text)
+    hud.face = text(x + U(44), rowY(y, 2), "", COLOR.text)
+    hud.spd  = text(x + U(44), rowY(y, 3), "", COLOR.text)
+    hud.mode = text(x + U(44), rowY(y, 4), "", COLOR.text)
     -- compass bar
-    local cx = LAYOUT.W / 2
-    local cy = compassY()
-    hud.cbg   = rect(cx - COMPASS_W / 2, cy, COMPASS_W, 15, COLOR.panel, 0.86)
-    hud.cline = rect(cx - COMPASS_W / 2, cy + 14, COMPASS_W, 1, COLOR.accent, 1)
-    hud.notch = rect(cx - 0.5, cy - 4, 1, 4, 0xFFFFFF, 1)
+    local cx, cy = LAYOUT.W / 2, barTop()
+    hud.cbg   = rect(cx - COMPASS_W / 2, cy, COMPASS_W, U(14), COLOR.panel, 0.82)
+    hud.cline = rect(cx - COMPASS_W / 2, cy + U(13), COMPASS_W, U(1), COLOR.accent, 1)
+    hud.notch = rect(cx - U(0.5), cy - U(4), U(1), U(4), 0xFFFFFF, 1)
     buildCompass()
   end
 
@@ -1401,16 +1397,16 @@ local function HUD_TOOLKIT(...)
   function buildCompass()
     clearCompass()
     if not hudShown then return end
-    local cx = LAYOUT.W / 2
+    local cx, cy = LAYOUT.W / 2, barTop()
     compass = { marks = {} }
     for i, m in ipairs(COMPASS_MARKS) do
-      compass.marks[i] = { a = m.a, label = m.label, obj = try(overlay.createText, {
-        gui = true, x = cx, y = compassY() + 4, content = "", color = m.color, shadow = true }) }
+      compass.marks[i] = { a = m.a, label = m.label, color = m.color,
+                           obj = text(cx, cy + U(3), "", m.color) }
     end
-    compass.wp    = rect(cx - 1.5, compassY() - 5, 0, 0, COLOR.waypoint, 1)
-    compass.label = try(overlay.createText, { gui = true, x = cx - 45, y = compassY() - 15, content = "", color = COLOR.waypoint, shadow = true })
-    compass.wpX = nil
-    compass.low   = try(overlay.createText, { gui = true, x = cx - 45, y = LAYOUT.H / 2 + 14, content = "", color = COLOR.bad, shadow = true })
+    compass.wp    = nil
+    compass.label = text(cx - U(40), cy - U(15), "", COLOR.waypoint)
+    compass.low   = text(cx - U(40), LAYOUT.H / 2 + 12, "", COLOR.bad)
+    compass.wpX   = nil
     lastYawKey = nil
   end
 
@@ -1423,26 +1419,23 @@ local function HUD_TOOLKIT(...)
 
   local function drawCompass(yaw, navBearing, navLabel, lowHp)
     if not compass then return end
-    local cx = LAYOUT.W / 2
-    local half = COMPASS_W / 2 - 10
+    local cx, cy = LAYOUT.W / 2, barTop()
+    local half = COMPASS_W / 2 - U(10)
+    local cw = U(6) / 2          -- half a character width
 
     if yaw then
       local yawKey = math.floor(yaw / 3 + 0.5)
-      if canMove == false and yawKey ~= lastYawKey then
-        -- no setter on this build: rebuild letters, but only on real turns
-        buildCompass()
-      end
+      if canMove == false and yawKey ~= lastYawKey then buildCompass() end
       if canMove ~= false or yawKey ~= lastYawKey then
         lastYawKey = yawKey
         for _, m in ipairs(compass.marks) do
           local rel = (m.a - yaw + 540) % 360 - 180
           if math.abs(rel) <= 90.5 then
-            setX(m.obj, cx + rel / 90 * half - #m.label * 3)
+            local px = cx + rel / 90 * half - #m.label * cw
+            setX(m.obj, px)
             if canMove == false then
-              -- created at cx; recreate at the right spot instead
               removeObj(m.obj)
-              m.obj = try(overlay.createText, { gui = true, x = cx + rel / 90 * half - #m.label * 3, y = compassY() + 4,
-                content = m.label, color = (m.a % 90 == 0) and COLOR.text or COLOR.label, shadow = true })
+              m.obj = text(px, cy + U(3), m.label, m.color)
             else
               setText(m.obj, m.label)
             end
@@ -1453,23 +1446,22 @@ local function HUD_TOOLKIT(...)
       end
     end
 
-    -- waypoint tick + label
+    -- waypoint: gold tick above the bar + name/distance above that
     if navBearing and yaw then
       local rel = (navBearing - yaw + 540) % 360 - 180
       local px = cx + math.max(-1, math.min(1, rel / 90)) * half
-      if compass.wp and type(compass.wp.setSizes) == "function" then pcall(compass.wp.setSizes, 3 * boxScale(), 5 * boxScale()) end
-      if canMove ~= false then
-        setX(compass.wp, px - 1.5)
+      if not compass.wp then
+        compass.wp = rect(px - U(1.5), cy - U(5), U(3), U(5), COLOR.waypoint, 1)
+      elseif canMove ~= false then
+        setX(compass.wp, px)                       -- rect x is its centre
       elseif not compass.wpX or math.abs(compass.wpX - px) >= 3 then
-        -- no setter: only re-place the tick when it has really moved
-        removeObj(compass.wp); compass.wp = rect(px - 1.5, compassY() - 5, 3, 5, COLOR.waypoint, 1)
+        removeObj(compass.wp); compass.wp = rect(px - U(1.5), cy - U(5), U(3), U(5), COLOR.waypoint, 1)
       end
       compass.wpX = px
       setText(compass.label, navLabel or "")
-      if canMove ~= false then setX(compass.label, cx - #(navLabel or "") * 3) end
+      if canMove ~= false then setX(compass.label, cx - #(navLabel or "") * cw) end
     else
-      if compass.wp and type(compass.wp.setSizes) == "function" then pcall(compass.wp.setSizes, 0, 0) end
-      if canMove == false and compass.wpX then removeObj(compass.wp); compass.wp = nil end
+      if compass.wp then removeObj(compass.wp); compass.wp = nil end
       compass.wpX = nil
       setText(compass.label, "")
     end
@@ -1919,6 +1911,7 @@ local function HUD_TOOLKIT(...)
     function M.start(opts)
       opts = opts or {}
       if opts.panelY then PANEL_Y = opts.panelY end
+      PANEL_X = U(4)
       loadWaypoints()
       rebuildAll()
     end
@@ -1967,7 +1960,7 @@ local LOG_HELP = {
   "managers   list known",
   "ally add/del/list <n>",
   "me <name>  set your name",
-  "uiscale <n> box width",
+  "uisize <n>  HUD size",
   "uiwidth <w> <h> screen",
   "uiinfo     screen info",
   "hide       hide all",
@@ -2061,24 +2054,24 @@ local function inputLoop()
         table.sort(l)
         out(#l > 0 and ("allies: " .. table.concat(l, ", ")) or "no allies yet")
       end
-    elseif cmd == "uiscale" then
+    elseif cmd == "uisize" or cmd == "uiscale" then
       local v = tonumber(words[2])
-      if v and v > 0.2 and v < 9 then
-        UI.box = v
-        local f = fs.open("/.glasses_box", "w"); f.write(tostring(v)); f.close()
+      if v and v >= 0.4 and v <= 1.5 then
+        UI.size = v
+        local f = fs.open("/.glasses_size", "w"); f.write(tostring(v)); f.close()
         HUD.rebuild()
         if toolkit then toolkit.setShown(HUD.shown) end
-        out("box scale " .. v .. " (saved)", colours.lime)
+        out("HUD size " .. v .. " (saved)", colours.lime)
       else
-        out("box scale " .. boxScale() .. (UI.box and " (set)" or " (auto)"))
-        out("= your GUI scale normally")
+        out("HUD size " .. UI.size .. "  (0.4 - 1.5)")
+        out("e.g. uisize 0.6 smaller")
       end
     elseif cmd == "uiinfo" then
       LAYOUT.compute()
       local r = LAYOUT.raw or {}
       out(("gui: %s x %s  scale %s"):format(tostring(r[1]), tostring(r[2]), tostring(r[3])))
       out(("using %d x %d"):format(LAYOUT.W, LAYOUT.H))
-      out("box scale " .. boxScale())
+      out("HUD size " .. UI.size)
     elseif cmd == "uiwidth" then
       local w, h = tonumber(words[2]), tonumber(words[3])
       if w and h then
