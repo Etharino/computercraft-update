@@ -104,7 +104,6 @@ end
 local function clearGroup(name)
   try(overlay.setAutoUpdate, false)
   for _, objs in pairs(groups[name]) do
-    for _, o in ipairs(objs) do removeObj(o) end
     removeGroupObjects(objs)
   end
   groups[name] = {}
@@ -397,19 +396,8 @@ local PLAYER_UPDATE = 0.25
 local espFov = tonumber(settings.get("glasses.esp_fov")) or 70
 local playerPoses = {}
 
--- Local pivots relative to a standing player's feet. The four limbs swing
--- from their shoulders or hips when successive samples show movement.
 -- The last value is the limb's swing direction. Other bones are static.
 local bones = {
-  {x = 0, y = 1.64, width = 0.22, length = 0.22, depth = 0.22, color = 0xF2FFFF},
-  {x = 0, y = 1.14, width = 0.07, length = 0.50, depth = 0.08},
-  {x = 0, y = 1.38, width = 0.53, length = 0.07, depth = 0.08},
-  {x = 0, y = 1.23, width = 0.36, length = 0.06, depth = 0.08},
-  {x = 0, y = 0.88, width = 0.31, length = 0.07, depth = 0.08},
-  {x = -0.24, y = 1.38, width = 0.07, length = 0.64, depth = 0.07, swing = -1},
-  {x = 0.24, y = 1.38, width = 0.07, length = 0.64, depth = 0.07, swing = 1},
-  {x = -0.13, y = 0.88, width = 0.08, length = 0.86, depth = 0.08, swing = 1},
-  {x = 0.13, y = 0.88, width = 0.08, length = 0.86, depth = 0.08, swing = -1},
   { 0, 1.53, 0, 0.87 },
   { -0.26, 1.38, 0.26, 1.38 },
   { -0.19, 1.22, 0.19, 1.22 },
@@ -420,7 +408,6 @@ local bones = {
   { 0.13, 0.88, 0.15, 0.05, -1 },
 }
 
-local function updateSkeleton(name, info, distance, viewer)
 local function projection(viewer)
   local yaw, pitch = math.rad(viewer.yaw or 0), math.rad(viewer.pitch or 0)
   local sinY, cosY = math.sin(yaw), math.cos(yaw)
@@ -464,40 +451,7 @@ local function updateSkeleton(name, pose, project)
     head.setSizes(size, size)
   end
 
-  local x, y, z = info.x, info.y, info.z
-  local movement = objects.x and math.sqrt((x - objects.x)^2 + (z - objects.z)^2) or 0
-  local stride = (objects.stride or 0) + math.min(movement, 1) * 8
-  objects.x, objects.z, objects.stride = x, z, stride
-  local swing = movement > 0.035 and math.sin(stride) * math.min(movement * 110, 46) or 0
-  local yaw = -(tonumber(info.yaw) or 0)
-  local sinYaw, cosYaw = math.sin(math.rad(yaw)), math.cos(math.rad(yaw))
-  local eyeHeight = tonumber(info.eyeHeight) or 1.62
-  local scale = math.max(0.35, math.min(1, eyeHeight / 1.62))
-  local tint = distance < 12 and 0xFF716F or 0x66EFFF
-
   for i, bone in ipairs(bones) do
-    local angle = (bone.swing or 0) * swing
-    local swingRad = math.rad(angle)
-    local half = bone.swing and bone.length / 2 or 0
-    local localX = bone.x
-    local localZ = -half * math.sin(swingRad)
-    local bx = x + localX * cosYaw + localZ * sinYaw
-    local by = y + (bone.y - half * math.cos(swingRad)) * scale
-    local bz = z - localX * sinYaw + localZ * cosYaw
-    local color = bone.color or tint
-    local object = objects[i]
-    if object then
-      try(object.setPos, bx, by, bz)
-      try(object.setRotX, angle % 360)
-      try(object.setRotY, yaw % 360)
-      try(object.setSizeY, bone.length * scale)
-      if objects.tint ~= tint and not bone.color then try(object.setColor, color) end
-    else
-      objects[i] = overlay.createBox({
-        x = bx, y = by, z = bz, sizeX = bone.width, sizeY = bone.length * scale, sizeZ = bone.depth,
-        rotX = angle % 360, rotY = yaw % 360, color = color, opacity = 0.92,
-        depthTest = false, depthMask = false,
-      })
     local x1, y1 = project(x + bone[1] * cosY, y + bone[2] * scale, z - bone[1] * sinY)
     local swing = bone[5] and math.rad(bone[5] * pose.swing) or 0
     local length = bone[2] - bone[4]
@@ -527,36 +481,17 @@ local function updateSkeleton(name, pose, project)
     end
   end
 
-  local labelIndex = #bones + 1
   local tagIndex = #bones + 2
   local tag = ("%s  %dm"):format(name, distance)
-  local tagY = y + 2.03 * scale
-  local dx, dz = viewer.x - x, viewer.z - z
-  local dy = viewer.y + (viewer.eyeHeight or 1.62) - tagY
-  local labelYaw = math.deg(atan2(dx, dz)) % 360
-  local pitch = math.deg(atan2(-dy, math.sqrt(dx * dx + dz * dz))) % 360
-  local tagObject = objects[labelIndex]
-  if tagObject then
-    try(tagObject.setPos, x, tagY, z)
-    try(tagObject.setRotX, pitch)
-    try(tagObject.setRotY, labelYaw)
-    if objects.tag ~= tag then try(tagObject.setContent, tag) end
-    if objects.tint ~= tint then try(tagObject.setColor, tint) end
   local tx, ty = math.max(10, math.min(screenW - 10, hx)), math.max(2, hy - size / 2 - 10)
-  if objects[tagIndex] then
-    local object = objects[tagIndex]
-    object.setPos(tx, ty, 0)
-    if objects.tag ~= tag then object.setContent(tag) end
-    if objects.tint ~= tint then object.setColor(tint) end
+  local nameTag = objects[tagIndex]
+  if nameTag then
+    nameTag.setPos(tx, ty, 0)
+    if objects.tag ~= tag then nameTag.setContent(tag) end
+    if objects.tint ~= tint then nameTag.setColor(tint) end
   else
-    objects[labelIndex] = overlay.createText({
-      x = x, y = tagY, z = z, rotX = pitch, rotY = labelYaw,
-      content = tag, center = true, shadow = true, fontSize = 0.024,
-      depthTest = false, depthMask = false, culling = false, color = tint,
-    objects[tagIndex] = overlay.createText({
-      gui = true, x = tx, y = ty, content = tag, center = true, shadow = true,
-      fontSize = 0.76, color = tint,
-    })
+    local newTag = text(tx, ty, tag, tint, true, 0.76)
+    objects[tagIndex] = newTag
   end
   objects.tint, objects.tag = tint, tag
   return true
@@ -579,15 +514,10 @@ local function renderPlayers(viewer)
 end
 
 local function refreshPlayers()
-  nearbyNames = {}
   local contacts, nextPoses = {}, {}
   local viewer = me()
-  local visible = {}
   if detector and viewer.x then
     local ownName = viewer.username or viewer.customName
-    local nearby = try(detector.getPlayersInRange, PLAYER_RANGE) or {}
-    for _, name in pairs(nearby) do
-      if type(name) == "table" then name = name.name end
     for _, entry in pairs(try(detector.getPlayersInRange, PLAYER_RANGE) or {}) do
       local name = type(entry) == "table" and entry.name or entry
       if type(name) == "string" and name ~= ownName then
@@ -595,11 +525,8 @@ local function refreshPlayers()
         if info and info.x and info.y and info.z and (not info.uuid or info.uuid ~= viewer.uuid) then
           local distance = math.floor(math.sqrt((info.x - viewer.x)^2
             + (info.y - viewer.y)^2 + (info.z - viewer.z)^2) + 0.5)
-          nearbyNames[#nearbyNames + 1] = name .. " " .. distance .. "m"
           contacts[#contacts + 1] = { name = name, distance = distance }
           if showPlayers and (not playerFilter or playerFilter[name:lower()]) then
-            visible[name] = true
-            updateSkeleton(name, info, distance, viewer)
             local old = playerPoses[name]
             local movement = old and old.dimension == viewer.dimension
               and math.sqrt((info.x - old.info.x)^2 + (info.z - old.info.z)^2) or 0
@@ -611,13 +538,7 @@ local function refreshPlayers()
         end
       end
     end
-    table.sort(nearbyNames)
   end
-  for name, objects in pairs(groups.players) do
-    if not visible[name] then
-      for _, object in ipairs(objects) do removeObj(object) end
-      groups.players[name] = nil
-    end
   playerPoses = nextPoses
   table.sort(contacts, function(a, b)
     if a.distance == b.distance then return a.name < b.name end
@@ -654,7 +575,6 @@ local function removeAllOwn()
   if dimObj then removeObj(dimObj) end
   for _, o in pairs(hud) do removeObj(o) end
   for _, g in pairs(groups) do
-    for _, objs in pairs(g) do for _, o in ipairs(objs) do removeObj(o) end end
     for _, objs in pairs(g) do removeGroupObjects(objs) end
   end
   try(overlay.update); try(overlay.setAutoUpdate, true)
@@ -675,7 +595,6 @@ end
 local function countObjects()
   local n = (dimObj and 1 or 0)
   for _ in pairs(hud) do n = n + 1 end
-  for _, g in pairs(groups) do for _, objs in pairs(g) do n = n + #objs end end
   for _, group in pairs(groups) do
     for _, objects in pairs(group) do
       for index in pairs(objects) do
@@ -694,7 +613,6 @@ local HELP = {
   "gps save <name> <x> <y> <z>",
   "supply <id> <minimum> | supply del <id> | supply",
   "ores | highlight <blocks> | nearest <block>",
-  "esp [names] | esp off | wp add/go/del/list <name> | stop",
   "esp [names] | esp off | esp fov <degrees>",
   "wp add/go/del/list <name> | stop",
   "dark | bright | clear [blocks|players|all] | hide | q",
@@ -819,7 +737,6 @@ local function handle(input)
     if not rest[1] then return say("nearest what?", COLOR.warn) end
     findNearest(rest[1])
   elseif cmd == "esp" or cmd == "players" then
-    if rest[1] == "off" then
     if rest[1] == "fov" then
       local fov = tonumber(rest[2])
       if #rest ~= 2 or not fov or fov < 30 or fov > 110 then
