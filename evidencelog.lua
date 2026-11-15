@@ -40,8 +40,16 @@
     evidencelog probe       check what your glasses can see first
     evidencelog pair <key>  link to your relay_base computer
 
-  KEYS (glasses terminal)
-    M = mark   S = summary   H = hide/show HUD   Q = quit
+  COMMANDS (type on the glasses terminal)
+    mark        save a MARK line (glasses hotkey does this too)
+    summary     counts so far
+    hide        hide/show everything
+    q           quit
+  Built-in HUD tools (no extra files needed):
+    ores | highlight <blocks> | nearest <block>
+    players [names] | wp add/go/del/list <name> | stop
+    dark | bright | clear [blocks|players|all]
+  Type 'help' for the full list.
 =====================================================================
 ]]
 
@@ -396,7 +404,11 @@ end
 
 function HUD.rebuild()
   if not HW.overlay then return end
-  try(HW.overlay.clear)
+  -- remove only our own objects, so the HUD toolkit's stay put
+  try(HW.overlay.setAutoUpdate, false)
+  for _, o in pairs(HUD.parts) do removeObject(o) end
+  for _, objs in pairs(HUD.markers) do for _, o in ipairs(objs) do removeObject(o) end end
+  try(HW.overlay.update); try(HW.overlay.setAutoUpdate, true)
   HUD.parts, HUD.markers = {}, {}
   if HUD.shown then HUD.build() end
 end
@@ -490,6 +502,7 @@ end
 ---------------------------------------------------------------------
 -- 8. FINDING INVENTORY MANAGERS
 ---------------------------------------------------------------------
+local toolkit              -- hud.lua module, loaded in section 13 if present
 local knownManagers = {}   -- "x,y,z" -> true (already logged)
 local currentManagers = {} -- key -> {x,y,z,dist}
 
@@ -499,23 +512,41 @@ local function isWatched(id)
   end
 end
 
-local function checkManagers()
+-- One scan, shared: if the HUD toolkit is loaded, reuse its cached scan
+-- (absolute coords) so both don't fight over the scanner's cooldown.
+local function scanBlocksAbsolute()
+  if toolkit and toolkit.scan then
+    local blocks = toolkit.scan()
+    return blocks
+  end
   local scan = HW.scanner and (HW.scanner.scanBlocks or HW.scanner.scan)
-  if not scan then return end
+  if not scan then return nil end
   local fx, fy, fz, ex, ey, ez = myPosition()
-  if not fx then return end
+  if not fx then return nil end
   if SETTINGS.SCAN_ORIGIN == "eye" then fx, fy, fz = ex, ey, ez end
   local bx, by, bz = math.floor(fx), math.floor(fy + 0.001), math.floor(fz)
+  local ok, raw = pcall(scan, SETTINGS.MANAGER_RADIUS)
+  if not ok or type(raw) ~= "table" then return nil end
+  local out = {}
+  for _, b in ipairs(raw) do
+    if type(b.name) == "string" and b.x then
+      out[#out + 1] = { name = b.name, x = bx + b.x, y = by + b.y, z = bz + b.z,
+                        d = b.x * b.x + b.y * b.y + b.z * b.z }
+    end
+  end
+  return out
+end
 
-  local ok, blocks = pcall(scan, SETTINGS.MANAGER_RADIUS)
-  if not ok or type(blocks) ~= "table" then return end
+local function checkManagers()
+  local blocks = scanBlocksAbsolute()
+  if type(blocks) ~= "table" then return end
 
   local found = {}
   for _, b in ipairs(blocks) do
     if type(b.name) == "string" and isWatched(b.name) then
-      local x, y, z = bx + b.x, by + b.y, bz + b.z
+      local x, y, z = b.x, b.y, b.z
       local key = x .. "," .. y .. "," .. z
-      found[key] = { x = x, y = y, z = z, dist = math.sqrt(b.x ^ 2 + b.y ^ 2 + b.z ^ 2) }
+      found[key] = { x = x, y = y, z = z, dist = math.sqrt(b.d or 0) }
       if not knownManagers[key] then
         knownManagers[key] = true
         stats.managers = stats.managers + 1
@@ -734,22 +765,661 @@ local function run()
       end
     elseif event == "glasses_key_pressed" then
       mark("hotkey")
-    elseif event == "key" then
-      if a == keys.m then mark("key")
-      elseif a == keys.s then summary()
-      elseif a == keys.h then HUD.shown = not HUD.shown; HUD.rebuild()
-      elseif a == keys.q then return end
     end
   end
+end
+
+---------------------------------------------------------------------
+-- 13a. HUD TOOLKIT (built in; formerly hud.lua)
+-- Highlights, nearest-block finder, players, waypoints, dark mode,
+-- info bar. Runs in its own scope and returns a small API.
+---------------------------------------------------------------------
+local function HUD_TOOLKIT(...)
+  -- Always "embedded" here: evidencelog calls HUD_TOOLKIT("hud").
+  local EMBEDDED = (... == "hud")
+
+  ---------------------------------------------------------------------
+  -- SETTINGS
+  ---------------------------------------------------------------------
+  local AI_URL       = nil    -- e.g. "http://192.168.1.50:8777" to enable the AI
+  local SCAN_RADIUS  = 16
+  local PLAYER_RANGE = 48
+  local MAX_BOXES    = 300
+  local SCAN_EVERY   = 3      -- seconds, only while block highlights are on
+  local INFO_EVERY   = 0.5
+  local WAYPOINT_FILE = "/.waypoints"
+
+  local PALETTE = {
+    ancient_debris = 0xFF5A00, diamond = 0x00FFFF, emerald = 0x00FF50,
+    gold = 0xFFD700, lapis = 0x2E5BFF, redstone = 0xFF1010, iron = 0xE8B48A,
+    copper = 0xFF8040, coal = 0x707070, quartz = 0xF0F0F0, obsidian = 0x9B30FF,
+    uranium = 0x7CFC00, osmium = 0x8FB4FF, zinc = 0xB0E0C0, spawner = 0xFF00AA,
+    chest = 0xFFAA00, barrel = 0xFFAA00,
+  }
+  local DEFAULT_BLOCK_COLOR = 0xFF00FF
+  local ORES = { "c:ores", "forge:ores", "_ore", "ancient_debris" }
+
+  local COLOR = {
+    panel = 0x0B0F14, bar = 0x1E3A5F, accent = 0x4FC3F7, text = 0xE6EDF3,
+    label = 0x9AA5B1, good = 0x5CE65C, warn = 0xFFC145, bad = 0xFF4D4D,
+    player = 0xFF2244, waypoint = 0xFFE14D, nav = 0x7CF0FF,
+  }
+
+  ---------------------------------------------------------------------
+  -- Helpers
+  ---------------------------------------------------------------------
+  local unpack = table.unpack or unpack
+  local function try(fn, ...)
+    if type(fn) ~= "function" then return nil end
+    local r = { pcall(fn, ...) }
+    if r[1] then return unpack(r, 2) end
+  end
+  local atan2 = math.atan2 or function(y, x) return math.atan(y, x) end
+  local function plain(id) return (tostring(id):gsub("^[^:]+:", "")) end
+
+  local function colorFor(name)
+    for key, c in pairs(PALETTE) do
+      if name:find(key, 1, true) then return c end
+    end
+    return DEFAULT_BLOCK_COLOR
+  end
+
+  ---------------------------------------------------------------------
+  -- Hardware
+  ---------------------------------------------------------------------
+  local function findOverlay()
+    if smartglasses and smartglasses.modules and smartglasses.modules.overlay then
+      return smartglasses.modules.overlay
+    end
+    local g = peripheral.find("smart_glasses")
+    if g and g.getModule then return try(g.getModule, "advancedperipherals:overlay") end
+  end
+
+  local overlay  = findOverlay()
+  local scanner  = peripheral.find("geo_scanner") or peripheral.find("geoScanner")
+  local detector = peripheral.find("player_detector") or peripheral.find("playerDetector")
+  if not overlay then error("Needs the Overlay Module in the glasses.", 0) end
+
+  local function me()
+    if smartglasses and smartglasses.getOwner then
+      local o = try(smartglasses.getOwner)
+      if type(o) == "table" then return o end
+    end
+    return {}
+  end
+
+  local function myPos()
+    local o = me()
+    if type(o.x) == "number" then return o.x, o.y, o.z end
+    local ex, ey, ez = try(overlay.getEyePosition)
+    if ex then return ex, ey - 1.62, ez end
+  end
+
+  ---------------------------------------------------------------------
+  -- Overlay object groups
+  ---------------------------------------------------------------------
+  local groups = { blocks = {}, players = {}, waypoint = {}, nearest = {} }
+  local dimObj
+  local hud = {}
+  local hudShown = true
+
+  local function removeObj(o)
+    local id = o and (try(o.getId) or o.id)
+    if id then pcall(overlay.removeObject, id) end
+  end
+
+  local function clearGroup(name)
+    try(overlay.setAutoUpdate, false)
+    for _, objs in pairs(groups[name]) do
+      for _, o in ipairs(objs) do removeObj(o) end
+    end
+    groups[name] = {}
+    try(overlay.update); try(overlay.setAutoUpdate, true)
+  end
+
+  local function box(x, y, z, sx, sy, sz, color, opacity)
+    return try(overlay.createBox, {
+      x = x, y = y, z = z, sizeX = sx, sizeY = sy, sizeZ = sz,
+      color = color, opacity = opacity or 0.5, depthTest = false, depthMask = false,
+    })
+  end
+
+  local function blockBox(x, y, z, color)
+    return box(x - 0.01, y - 0.01, z - 0.01, 1.02, 1.02, 1.02, color, 0.5)
+  end
+
+  local function label(x, y, z, content, color)
+    return try(overlay.createText, {
+      x = x, y = y, z = z, content = content, color = color, shadow = true, center = true,
+    })
+  end
+
+  -- A tall light beam you can see from far away.
+  local function beacon(x, y, z, color, text)
+    return {
+      box(x + 0.35, y, z + 0.35, 0.3, 48, 0.3, color, 0.35),
+      blockBox(x, y, z, color),
+      label(x + 0.5, y + 1.8, z + 0.5, text, color),
+    }
+  end
+
+  ---------------------------------------------------------------------
+  -- HUD panel
+  ---------------------------------------------------------------------
+  local PANEL_X, PANEL_Y, PANEL_W = 6, 6, 250
+
+  local function text(x, y, content, color)
+    return try(overlay.createText, { gui = true, x = x, y = y, content = content, color = color, shadow = true })
+  end
+  local function rect(x, y, w, h, color, opacity)
+    return try(overlay.createRectangle, { gui = true, x = x, y = y, sizeX = w, sizeY = h, color = color, opacity = opacity })
+  end
+
+  local function buildHud()
+    for _, o in pairs(hud) do removeObj(o) end
+    hud = {}
+    if not hudShown then return end
+    local x, y, w = PANEL_X, PANEL_Y, PANEL_W
+    hud.bg     = rect(x, y, w, 70, COLOR.panel, 0.7)
+    hud.bar    = rect(x, y, w, 14, COLOR.bar, 0.9)
+    hud.title  = text(x + 6, y + 3, "HUD", COLOR.accent)
+    hud.clock  = text(x + w - 46, y + 3, "", COLOR.label)
+    hud.pos    = text(x + 6, y + 19, "", COLOR.text)
+    hud.vitals = text(x + 6, y + 30, "", COLOR.text)
+    hud.nav    = text(x + 6, y + 41, "", COLOR.nav)
+    hud.msg    = text(x + 6, y + 54, "type 'help' on the glasses", COLOR.label)
+  end
+
+  local function set(obj, content, color)
+    if not obj then return end
+    pcall(obj.setContent, content)
+    if color and obj.setColor then pcall(obj.setColor, color) end
+  end
+
+  local msgUntil = 0
+  local function say(s, color)
+    set(hud.msg, s, color or COLOR.text)
+    msgUntil = os.epoch("utc") + 8000
+    print(s)
+  end
+
+  ---------------------------------------------------------------------
+  -- Direction maths
+  ---------------------------------------------------------------------
+  -- Minecraft yaw: 0 = south (+z), 90 = west, 180 = north, -90 = east.
+  local function facingName(yaw)
+    local dirs = { "S", "SW", "W", "NW", "N", "NE", "E", "SE" }
+    local i = math.floor(((yaw % 360) + 22.5) / 45) % 8 + 1
+    return dirs[i]
+  end
+
+  local function compassTo(dx, dz)
+    local ns = dz < -0.5 and "N" or (dz > 0.5 and "S" or "")
+    local ew = dx > 0.5 and "E" or (dx < -0.5 and "W" or "")
+    return (ns .. ew ~= "") and (ns .. ew) or "here"
+  end
+
+  -- Where the target is relative to where you're looking.
+  local function relativeDir(dx, dz, yaw)
+    if not yaw then return compassTo(dx, dz) end
+    local bearing = math.deg(atan2(-dx, dz))
+    local rel = (bearing - yaw + 540) % 360 - 180   -- -180..180, + = right
+    local a = math.abs(rel)
+    if a < 20 then return "^ ahead" end
+    if a > 160 then return "v behind" end
+    local side = rel > 0 and "right" or "left"
+    local arrow = rel > 0 and ">" or "<"
+    return ("%s %s %d"):format(arrow, side, math.floor(a + 0.5))
+  end
+
+  ---------------------------------------------------------------------
+  -- Waypoints
+  ---------------------------------------------------------------------
+  local waypoints = {}
+  local navTarget = nil   -- { name, x, y, z }
+
+  local function loadWaypoints()
+    if fs.exists(WAYPOINT_FILE) then
+      local f = fs.open(WAYPOINT_FILE, "r")
+      waypoints = textutils.unserialise(f.readAll()) or {}
+      f.close()
+    end
+  end
+
+  local function saveWaypoints()
+    local f = fs.open(WAYPOINT_FILE, "w")
+    f.write(textutils.serialise(waypoints)); f.close()
+  end
+
+  local function navigate(name, x, y, z, color)
+    navTarget = { name = name, x = x, y = y, z = z }
+    clearGroup("waypoint")
+    groups.waypoint[name] = beacon(x, y, z, color or COLOR.waypoint, name)
+  end
+
+  ---------------------------------------------------------------------
+  -- Block scanning
+  ---------------------------------------------------------------------
+  local blockTargets = nil   -- list of substrings, or nil
+  local lastScan, lastScanAt = nil, 0
+
+  local function scan()
+    local fn = scanner and (scanner.scanBlocks or scanner.scan)
+    if not fn then return nil, "no Geo Scanner" end
+    if lastScan and os.epoch("utc") - lastScanAt < 1500 then return lastScan end
+    local fx, fy, fz = myPos()
+    if not fx then return nil, "position unknown" end
+    local ok, res = pcall(fn, SCAN_RADIUS)
+    if not ok or type(res) ~= "table" then return nil, "scanner busy" end
+    local bx, by, bz = math.floor(fx), math.floor(fy + 0.001), math.floor(fz)
+    local out = {}
+    for _, b in ipairs(res) do
+      if type(b.name) == "string" and b.x then
+        out[#out + 1] = { name = b.name, tags = b.tags, x = bx + b.x, y = by + b.y, z = bz + b.z,
+                          d = b.x * b.x + b.y * b.y + b.z * b.z }
+      end
+    end
+    lastScan, lastScanAt = out, os.epoch("utc")
+    return out
+  end
+
+  local function matches(b, targets)
+    for _, t in ipairs(targets) do
+      if b.name:find(t, 1, true) then return true end
+      if type(b.tags) == "table" then
+        for k, v in pairs(b.tags) do
+          if (type(v) == "string" and v:find(t, 1, true)) or (type(k) == "string" and k:find(t, 1, true)) then
+            return true
+          end
+        end
+      end
+    end
+    return false
+  end
+
+  local function refreshBlocks()
+    if not blockTargets then return end
+    local blocks, err = scan()
+    if not blocks then return 0, err end
+    table.sort(blocks, function(a, b) return a.d < b.d end)
+    local want, n = {}, 0
+    for _, b in ipairs(blocks) do
+      if n >= MAX_BOXES then break end
+      if matches(b, blockTargets) then
+        want[b.x .. "," .. b.y .. "," .. b.z] = b
+        n = n + 1
+      end
+    end
+    try(overlay.setAutoUpdate, false)
+    for k, objs in pairs(groups.blocks) do
+      if not want[k] then for _, o in ipairs(objs) do removeObj(o) end; groups.blocks[k] = nil end
+    end
+    for k, b in pairs(want) do
+      if not groups.blocks[k] then groups.blocks[k] = { blockBox(b.x, b.y, b.z, colorFor(b.name)) } end
+    end
+    try(overlay.update); try(overlay.setAutoUpdate, true)
+    return n
+  end
+
+  local function findNearest(target)
+    local blocks, err = scan()
+    if not blocks then return say("Can't scan: " .. err, COLOR.bad) end
+    local best
+    for _, b in ipairs(blocks) do
+      if matches(b, { target }) and (not best or b.d < best.d) then best = b end
+    end
+    if not best then return say("No " .. target .. " within " .. SCAN_RADIUS .. " blocks", COLOR.warn) end
+    navigate(plain(best.name), best.x, best.y, best.z, colorFor(best.name))
+    say(("Nearest %s: %d %d %d"):format(plain(best.name), best.x, best.y, best.z), COLOR.good)
+  end
+
+  ---------------------------------------------------------------------
+  -- Players
+  ---------------------------------------------------------------------
+  local showPlayers = false   -- outline players?
+  local playerFilter = nil    -- list of names, or nil for everyone
+  local nearbyNames = {}
+
+  local function refreshPlayers()
+    clearGroup("players")
+    nearbyNames = {}
+    if not detector then return end
+    local myName = me().name
+    local fx, fy, fz = myPos()
+    for _, p in pairs(try(detector.getPlayersInRange, PLAYER_RANGE) or {}) do
+      local name = type(p) == "table" and p.name or p
+      if type(name) == "string" and name ~= myName then
+        local info = try(detector.getPlayer, name)
+        local dist = "?"
+        if type(info) == "table" and info.x and fx then
+          dist = math.floor(math.sqrt((info.x - fx) ^ 2 + (info.y - fy) ^ 2 + (info.z - fz) ^ 2) + 0.5)
+        end
+        nearbyNames[#nearbyNames + 1] = name .. " " .. dist .. "m"
+        local wanted = showPlayers and (not playerFilter)
+        if showPlayers and playerFilter then
+          for _, n in ipairs(playerFilter) do if n:lower() == name:lower() then wanted = true end end
+        end
+        if wanted and type(info) == "table" and info.x then
+          local x, y, z = info.x - 0.35, info.y, info.z - 0.35
+          groups.players[name] = {
+            box(x, y, z, 0.7, 1.9, 0.7, COLOR.player, 0.35),
+            label(info.x, info.y + 2.3, info.z, name .. "  " .. dist .. "m", COLOR.player),
+          }
+        end
+      end
+    end
+  end
+
+  ---------------------------------------------------------------------
+  -- Dark mode
+  ---------------------------------------------------------------------
+  -- A big dark box that follows your head, drawn over terrain.
+  local function setDark(on)
+    if dimObj then removeObj(dimObj); dimObj = nil end
+    if on then
+      dimObj = try(overlay.createBox, {
+        relativePosition = true, x = -32, y = -32, z = -32,
+        sizeX = 64, sizeY = 64, sizeZ = 64, color = 0x000000, opacity = 0.8,
+        culling = false, depthTest = false, depthMask = false,
+      })
+    end
+  end
+
+  ---------------------------------------------------------------------
+  -- Rebuild everything (after hide/show, dark toggle, or overlay wipe)
+  ---------------------------------------------------------------------
+  local dark = false
+  -- Remove only OUR objects, so other programs' overlays stay put.
+  local function removeAllOwn()
+    try(overlay.setAutoUpdate, false)
+    if dimObj then removeObj(dimObj) end
+    for _, o in pairs(hud) do removeObj(o) end
+    for _, g in pairs(groups) do
+      for _, objs in pairs(g) do for _, o in ipairs(objs) do removeObj(o) end end
+    end
+    try(overlay.update); try(overlay.setAutoUpdate, true)
+  end
+
+  local function rebuildAll()
+    removeAllOwn()
+    groups = { blocks = {}, players = {}, waypoint = {}, nearest = {} }
+    dimObj, hud = nil, {}
+    if not hudShown then return end
+    if dark then setDark(true) end
+    buildHud()
+    if navTarget then navigate(navTarget.name, navTarget.x, navTarget.y, navTarget.z) end
+    refreshBlocks()
+    if showPlayers then refreshPlayers() end
+  end
+
+  local function countObjects()
+    local n = (dimObj and 1 or 0)
+    for _ in pairs(hud) do n = n + 1 end
+    for _, g in pairs(groups) do for _, objs in pairs(g) do n = n + #objs end end
+    return n
+  end
+
+  ---------------------------------------------------------------------
+  -- Commands
+  ---------------------------------------------------------------------
+  local HELP = {
+    "ores | highlight <blocks> | nearest <block>",
+    "players [names] | wp add/go/del/list <name> | stop",
+    "dark | bright | clear [blocks|players|all] | hide | q",
+  }
+
+  local function askAI(input)
+    if not AI_URL or not http then return false end
+    say("thinking...", COLOR.warn)
+    local ok, resp = pcall(http.post, AI_URL, textutils.serialiseJSON({ prompt = input }),
+                           { ["Content-Type"] = "application/json" })
+    if not ok or not resp then say("AI offline", COLOR.bad) return true end
+    local data = textutils.unserialiseJSON(resp.readAll()); resp.close()
+    for _, a in ipairs((type(data) == "table" and data.actions) or {}) do
+      if a.action == "highlight_blocks" and type(a.targets) == "table" then
+        blockTargets = {}
+        for _, t in ipairs(a.targets) do blockTargets[#blockTargets + 1] = plain(t) end
+        say(("highlighting %d"):format(refreshBlocks() or 0), COLOR.good)
+      elseif a.action == "highlight_players" then
+        showPlayers, playerFilter = true, (type(a.names) == "table" and #a.names > 0) and a.names or nil
+        refreshPlayers()
+      elseif a.action == "clear" then
+        blockTargets, showPlayers = nil, false
+        clearGroup("blocks"); clearGroup("players")
+      elseif a.action == "dark_mode" then
+        dark = a.on ~= false; rebuildAll()
+      elseif a.action == "say" then
+        say(tostring(a.text or ""), COLOR.accent)
+      end
+    end
+    return true
+  end
+
+  local function handle(input)
+    local words = {}
+    for w in input:gmatch("%S+") do words[#words + 1] = w end
+    local cmd = (words[1] or ""):lower()
+    local rest = {}
+    for i = 2, #words do rest[#rest + 1] = words[i]:lower() end
+
+    if cmd == "" then return
+    elseif cmd == "help" then for _, l in ipairs(HELP) do print(l) end; say(HELP[1], COLOR.label)
+    elseif cmd == "ores" then
+      blockTargets = ORES
+      say(("ores: %d found"):format(refreshBlocks() or 0), COLOR.good)
+    elseif cmd == "highlight" or cmd == "show" then
+      if #rest == 0 then return say("highlight what?", COLOR.warn) end
+      if rest[1] == "players" then showPlayers, playerFilter = true, nil; refreshPlayers(); return say("players on", COLOR.good) end
+      blockTargets = rest
+      say(("%s: %d found"):format(table.concat(rest, ", "), refreshBlocks() or 0), COLOR.good)
+    elseif cmd == "nearest" or cmd == "find" then
+      if not rest[1] then return say("nearest what?", COLOR.warn) end
+      findNearest(rest[1])
+    elseif cmd == "players" then
+      showPlayers = true
+      playerFilter = #rest > 0 and rest or nil
+      refreshPlayers()
+      say("players on" .. (playerFilter and (": " .. table.concat(rest, ", ")) or ""), COLOR.good)
+    elseif cmd == "wp" or cmd == "waypoint" then
+      local sub, name = rest[1], rest[2]
+      if sub == "add" and name then
+        local x, y, z = myPos()
+        if not x then return say("position unknown", COLOR.bad) end
+        waypoints[name] = { x = math.floor(x), y = math.floor(y), z = math.floor(z) }
+        saveWaypoints()
+        say(("saved %s at %d %d %d"):format(name, waypoints[name].x, waypoints[name].y, waypoints[name].z), COLOR.good)
+      elseif sub == "go" and name then
+        local w = waypoints[name]
+        if not w then return say("no waypoint " .. name, COLOR.warn) end
+        navigate(name, w.x, w.y, w.z)
+        say("navigating to " .. name, COLOR.good)
+      elseif sub == "del" and name then
+        waypoints[name] = nil; saveWaypoints()
+        if navTarget and navTarget.name == name then navTarget = nil; clearGroup("waypoint") end
+        say("deleted " .. name, COLOR.text)
+      else
+        local names = {}
+        for n in pairs(waypoints) do names[#names + 1] = n end
+        table.sort(names)
+        say(#names > 0 and ("waypoints: " .. table.concat(names, ", ")) or "no waypoints yet", COLOR.text)
+      end
+    elseif cmd == "stop" then
+      navTarget = nil; clearGroup("waypoint"); say("navigation off", COLOR.text)
+    elseif cmd == "dark" then dark = true; rebuildAll(); say("dark on", COLOR.good)
+    elseif cmd == "bright" then dark = false; rebuildAll(); say("dark off", COLOR.text)
+    elseif cmd == "clear" then
+      local what = rest[1] or "all"
+      if what == "blocks" or what == "all" then blockTargets = nil; clearGroup("blocks") end
+      if what == "players" or what == "all" then showPlayers = false; clearGroup("players") end
+      if what == "all" then navTarget = nil; clearGroup("waypoint") end
+      say("cleared " .. what, COLOR.text)
+    elseif cmd == "hide" then hudShown = not hudShown; rebuildAll()
+    else
+      return askAI(input)   -- false = not handled
+    end
+    return true
+  end
+
+  ---------------------------------------------------------------------
+  -- Loops
+  ---------------------------------------------------------------------
+  local function infoLoop()
+    while true do
+      if hudShown then
+        if countObjects() > (try(overlay.getObjectsCount) or 1e9) then rebuildAll() end
+        local o = me()
+        local x, y, z = myPos()
+        if x then
+          set(hud.pos, ("%d %d %d   facing %s"):format(math.floor(x), math.floor(y), math.floor(z),
+              o.yaw and facingName(o.yaw) or "?"))
+        end
+        local hp = (o.health and o.maxHealth) and ("HP %d/%d"):format(math.floor(o.health), math.floor(o.maxHealth)) or "HP ?"
+        local act = {}
+        if blockTargets then act[#act + 1] = "blocks" end
+        if showPlayers then act[#act + 1] = "players" end
+        if dark then act[#act + 1] = "dark" end
+        set(hud.vitals, hp .. "   " .. (#act > 0 and table.concat(act, " + ") or "idle"))
+        set(hud.clock, textutils.formatTime(os.time(), true))
+        if navTarget and x then
+          local dx, dz = navTarget.x + 0.5 - x, navTarget.z + 0.5 - z
+          local dist = math.floor(math.sqrt(dx * dx + dz * dz + (navTarget.y - y) ^ 2) + 0.5)
+          local dy = navTarget.y - math.floor(y)
+          local height = dy > 1 and (" up " .. dy) or (dy < -1 and (" down " .. -dy) or "")
+          set(hud.nav, ("%s %dm  %s%s"):format(navTarget.name, dist, relativeDir(dx, dz, o.yaw), height))
+        else
+          set(hud.nav, #nearbyNames > 0 and ("near: " .. table.concat(nearbyNames, ", ")) or "")
+        end
+        if os.epoch("utc") > msgUntil then set(hud.msg, "") end
+      end
+      sleep(INFO_EVERY)
+    end
+  end
+
+  local function scanLoop()
+    while true do
+      sleep(SCAN_EVERY)
+      if hudShown and blockTargets then refreshBlocks() end
+      if hudShown and (showPlayers or detector) then refreshPlayers() end
+    end
+  end
+
+  local function hotkeyLoop()
+    while true do
+      os.pullEvent("glasses_key_pressed")
+      hudShown = not hudShown
+      rebuildAll()
+    end
+  end
+
+  local function inputLoop()
+    while true do
+      term.setTextColour(colours.lightBlue); write("> "); term.setTextColour(colours.white)
+      local line = read()
+      if not line or line:lower() == "q" then return end
+      local ok, handled = pcall(handle, line)
+      if not ok then printError(handled)
+      elseif not handled then say("unknown: " .. line .. "  (type help)", COLOR.warn) end
+    end
+  end
+
+  ---------------------------------------------------------------------
+  -- Module mode: evidencelog loads us and drives the loops itself
+  ---------------------------------------------------------------------
+  if EMBEDDED then
+    local M = { help = HELP }
+    -- opts.panelY: where to put our panel (below the logger's)
+    function M.start(opts)
+      opts = opts or {}
+      if opts.panelY then PANEL_Y = opts.panelY end
+      loadWaypoints()
+      rebuildAll()
+    end
+    function M.handle(line)
+      local ok, handled = pcall(handle, line)
+      if not ok then printError(handled) return true end
+      return handled
+    end
+    M.loops = { infoLoop, scanLoop }
+    M.scan = function() return (scan()) end   -- shared, cached scan (absolute coords)
+    function M.setShown(v) hudShown = v; rebuildAll() end
+    function M.isShown() return hudShown end
+    function M.stop() removeAllOwn() end
+    return M
+  end
+
+  ---------------------------------------------------------------------
+  -- Start (standalone)
+  ---------------------------------------------------------------------
+  term.clear(); term.setCursorPos(1, 1)
+  print("HUD toolkit. Type 'help'. Hotkey hides/shows.")
+  if not scanner then print("(no Geo Scanner: block tools off)") end
+  if not detector then print("(no Player Detector: player tools off)") end
+  print(AI_URL and ("AI: " .. AI_URL) or "AI: off (works fully offline)")
+  loadWaypoints()
+  rebuildAll()
+
+  local ok, err = pcall(parallel.waitForAny, inputLoop, infoLoop, scanLoop, hotkeyLoop)
+  try(overlay.clear)
+  if not ok and err ~= "Terminated" then printError(err) end
+  print("HUD stopped.")
+end
+
+---------------------------------------------------------------------
+-- 13. HUD TOOLKIT + COMMAND LINE
+---------------------------------------------------------------------
+do
+  local ok, mod = pcall(HUD_TOOLKIT, "hud")
+  if ok and type(mod) == "table" and mod.start then toolkit = mod
+  elseif not ok then printError("HUD toolkit failed to load: " .. tostring(mod)) end
+end
+
+local LOG_HELP = {
+  "mark | summary | hide | q   (evidence log)",
+}
+
+local function inputLoop()
+  while true do
+    term.setTextColour(colours.lightBlue); write("> "); term.setTextColour(colours.white)
+    local line = read()
+    if not line then return end
+    local cmd = line:lower():match("^%s*(%S*)")
+    if cmd == "q" or cmd == "quit" then return
+    elseif cmd == "mark" or cmd == "m" then mark("typed")
+    elseif cmd == "summary" or cmd == "s" then summary()
+    elseif cmd == "hide" then
+      HUD.shown = not HUD.shown; HUD.rebuild()
+      if toolkit then toolkit.setShown(HUD.shown) end
+    elseif cmd == "help" then
+      for _, l in ipairs(LOG_HELP) do print(l) end
+      if toolkit then for _, l in ipairs(toolkit.help) do print(l) end
+      else print("(HUD tools unavailable: no Overlay Module?)") end
+    elseif cmd ~= "" then
+      if not (toolkit and toolkit.handle(line)) then
+        print("unknown: " .. cmd .. "  (type help)")
+      end
+    end
+  end
+end
+
+local function main()
+  HUD.rebuild()
+  local loops = { run, inputLoop }
+  if toolkit then
+    -- put the toolkit's panel under ours (and under the alert banner)
+    toolkit.start({ panelY = SETTINGS.HUD_Y + HEADER_H + #ROWS * ROW_H + PAD + 24 })
+    for _, l in ipairs(toolkit.loops) do loops[#loops + 1] = l end
+  end
+  parallel.waitForAny(table.unpack(loops))
 end
 
 term.clear(); term.setCursorPos(1, 1)
 writeLog("START", ("you=%s card=%s manager=%s scanner=%s detector=%s")
   :format(tostring(myName()), tostring(managerOwner()), tostring(HW.manager ~= nil),
           tostring(HW.scanner ~= nil), tostring(HW.detector ~= nil)))
-print("M mark  S summary  H hide HUD  Q quit")
+print("Type 'help'. Hotkey = mark.")
 
-local ok, err = pcall(run)
+local ok, err = pcall(main)
+if toolkit then toolkit.stop() end
 if HW.overlay then try(HW.overlay.clear) end
 writeLog("STOP", "stopped")
 if not ok and err ~= "Terminated" then printError(err) end
