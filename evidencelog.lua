@@ -106,15 +106,17 @@ local COLOR = {
   marker  = 0xFF3355, markerCore = 0xFFFFFF,
 }
 
--- UI scale: in-game, overlay rectangles draw at about half the width of
--- the same numbers used for text. RECT_X stretches boxes to match.
--- Tune live with:  uiscale 1.8   (saved to /.glasses_ui)
-local UI = { rectX = 2 }
-if fs.exists("/.glasses_ui") then
-  local f = fs.open("/.glasses_ui", "r")
+-- Box sizes: the overlay places rectangles in GUI units (like text) but
+-- SIZES them in raw pixels, so sizes get multiplied by your GUI scale.
+-- Detected automatically; force with:  uiscale 2   (saved to /.glasses_box)
+local UI = { box = nil }
+if fs.exists("/.glasses_box") then
+  local f = fs.open("/.glasses_box", "r")
   local v = tonumber(f.readAll()); f.close()
-  if v and v > 0.2 and v < 5 then UI.rectX = v end
+  if v and v > 0.2 and v < 9 then UI.box = v end
 end
+local LAYOUT   -- set up in section 5
+local function boxScale() return UI.box or (LAYOUT and LAYOUT.scale) or 2 end
 
 -- Terminal output. Once the layout is up, lines go into the log window
 -- so they don't scroll the status bar or your typing away.
@@ -338,7 +340,7 @@ local HUD = { shown = true, parts = {}, markers = {}, alertUntil = 0,
 -- Positions are in overlay text units. getGuiSize() may report raw pixels
 -- or GUI-scaled units depending on the build, so big raw-looking numbers
 -- get divided by the scale. Override with:  uiwidth 640 360
-local LAYOUT = { W = 480, H = 270 }
+LAYOUT = { W = 480, H = 270, scale = nil }
 function LAYOUT.compute()
   local a, b, c
   if HW.overlay then a, b, c = try(HW.overlay.getGuiSize) end
@@ -352,6 +354,7 @@ function LAYOUT.compute()
   local sc, h, w
   if #nums >= 3 then sc, h, w = nums[1], nums[2], nums[3]
   elseif #nums == 2 then h, w = nums[1], nums[2] end
+  if sc and sc >= 1 and sc <= 8 then LAYOUT.scale = sc end
   -- Raw pixel sizes (height > 600) get converted to GUI units.
   if w and h and sc and sc >= 1 and sc <= 8 and h > 600 then w, h = w / sc, h / sc end
   if not w or w < 240 or not h or h < 140 then w, h = 480, 270 end   -- implausible: safe default
@@ -385,7 +388,7 @@ end
 
 local function rect(x, y, w, h, color, opacity)
   return try(HW.overlay.createRectangle, {
-    gui = true, x = x * UI.rectX, y = y, sizeX = w * UI.rectX, sizeY = h,
+    gui = true, x = x, y = y, sizeX = w * boxScale(), sizeY = h * boxScale(),
     color = color, opacity = opacity,
   })
 end
@@ -524,7 +527,7 @@ function HUD.alert(message, color)
     local longest = 0
     for _, l in ipairs(lines) do longest = math.max(longest, #l) end
     local w, h = longest * 6 + 16, #lines * 10 + 6
-    local x, y = LAYOUT.W / 2 - w / 2, 36
+    local x, y = LAYOUT.W / 2 - w / 2, LAYOUT.H / 2 - 30 - h
     color = color or COLOR.bad
     HUD.toast[#HUD.toast + 1] = rect(x, y, w, h, COLOR.panel, 0.9)
     HUD.toast[#HUD.toast + 1] = rect(x, y, 3, h, color, 1)
@@ -1294,12 +1297,14 @@ local function HUD_TOOLKIT(...)
     return try(overlay.createText, { gui = true, x = x, y = y, content = content, color = color, shadow = true })
   end
   local function rect(x, y, w, h, color, opacity)
-    return try(overlay.createRectangle, { gui = true, x = x * UI.rectX, y = y,
-      sizeX = w * UI.rectX, sizeY = h, color = color, opacity = opacity })
+    return try(overlay.createRectangle, { gui = true, x = x, y = y,
+      sizeX = w * boxScale(), sizeY = h * boxScale(), color = color, opacity = opacity })
   end
 
   -- Left side: NAV card.  Top centre: compass bar.
   local COMPASS_W = 160
+  -- top of the compass bar: above armour/health/hotbar, below Jade's tooltip
+  local function compassY() return LAYOUT.H - 76 end
   local buildCompass   -- defined with the compass code below
   local function buildHud()
     for _, o in pairs(hud) do removeObj(o) end
@@ -1317,9 +1322,10 @@ local function HUD_TOOLKIT(...)
     hud.mode = text(x + 40, rowY(y, 4), "", COLOR.text)
     -- compass bar
     local cx = LAYOUT.W / 2
-    hud.cbg   = rect(cx - COMPASS_W / 2, 4, COMPASS_W, 15, COLOR.panel, 0.86)
-    hud.cline = rect(cx - COMPASS_W / 2, 18, COMPASS_W, 1, COLOR.accent, 1)
-    hud.notch = rect(cx - 0.5, 19, 1, 4, 0xFFFFFF, 1)
+    local cy = compassY()
+    hud.cbg   = rect(cx - COMPASS_W / 2, cy, COMPASS_W, 15, COLOR.panel, 0.86)
+    hud.cline = rect(cx - COMPASS_W / 2, cy + 14, COMPASS_W, 1, COLOR.accent, 1)
+    hud.notch = rect(cx - 0.5, cy - 4, 1, 4, 0xFFFFFF, 1)
     buildCompass()
   end
 
@@ -1399,10 +1405,10 @@ local function HUD_TOOLKIT(...)
     compass = { marks = {} }
     for i, m in ipairs(COMPASS_MARKS) do
       compass.marks[i] = { a = m.a, label = m.label, obj = try(overlay.createText, {
-        gui = true, x = cx, y = 8, content = "", color = m.color, shadow = true }) }
+        gui = true, x = cx, y = compassY() + 4, content = "", color = m.color, shadow = true }) }
     end
-    compass.wp    = rect(cx - 1.5, 17, 0, 0, COLOR.waypoint, 1)
-    compass.label = try(overlay.createText, { gui = true, x = cx - 45, y = 24, content = "", color = COLOR.waypoint, shadow = true })
+    compass.wp    = rect(cx - 1.5, compassY() - 5, 0, 0, COLOR.waypoint, 1)
+    compass.label = try(overlay.createText, { gui = true, x = cx - 45, y = compassY() - 15, content = "", color = COLOR.waypoint, shadow = true })
     compass.wpX = nil
     compass.low   = try(overlay.createText, { gui = true, x = cx - 45, y = LAYOUT.H / 2 + 14, content = "", color = COLOR.bad, shadow = true })
     lastYawKey = nil
@@ -1435,7 +1441,7 @@ local function HUD_TOOLKIT(...)
             if canMove == false then
               -- created at cx; recreate at the right spot instead
               removeObj(m.obj)
-              m.obj = try(overlay.createText, { gui = true, x = cx + rel / 90 * half - #m.label * 3, y = 8,
+              m.obj = try(overlay.createText, { gui = true, x = cx + rel / 90 * half - #m.label * 3, y = compassY() + 4,
                 content = m.label, color = (m.a % 90 == 0) and COLOR.text or COLOR.label, shadow = true })
             else
               setText(m.obj, m.label)
@@ -1451,12 +1457,12 @@ local function HUD_TOOLKIT(...)
     if navBearing and yaw then
       local rel = (navBearing - yaw + 540) % 360 - 180
       local px = cx + math.max(-1, math.min(1, rel / 90)) * half
-      if compass.wp and type(compass.wp.setSizes) == "function" then pcall(compass.wp.setSizes, 3 * UI.rectX, 6) end
+      if compass.wp and type(compass.wp.setSizes) == "function" then pcall(compass.wp.setSizes, 3 * boxScale(), 5 * boxScale()) end
       if canMove ~= false then
-        setX(compass.wp, (px - 1.5) * UI.rectX)
+        setX(compass.wp, px - 1.5)
       elseif not compass.wpX or math.abs(compass.wpX - px) >= 3 then
         -- no setter: only re-place the tick when it has really moved
-        removeObj(compass.wp); compass.wp = rect(px - 1.5, 17, 3, 6, COLOR.waypoint, 1)
+        removeObj(compass.wp); compass.wp = rect(px - 1.5, compassY() - 5, 3, 5, COLOR.waypoint, 1)
       end
       compass.wpX = px
       setText(compass.label, navLabel or "")
@@ -2057,23 +2063,22 @@ local function inputLoop()
       end
     elseif cmd == "uiscale" then
       local v = tonumber(words[2])
-      if v and v > 0.2 and v < 5 then
-        UI.rectX = v
-        local f = fs.open("/.glasses_ui", "w"); f.write(tostring(v)); f.close()
+      if v and v > 0.2 and v < 9 then
+        UI.box = v
+        local f = fs.open("/.glasses_box", "w"); f.write(tostring(v)); f.close()
         HUD.rebuild()
         if toolkit then toolkit.setShown(HUD.shown) end
         out("box scale " .. v .. " (saved)", colours.lime)
       else
-        out("uiscale is " .. UI.rectX)
-        out("boxes too narrow: raise")
-        out("boxes too wide: lower")
+        out("box scale " .. boxScale() .. (UI.box and " (set)" or " (auto)"))
+        out("= your GUI scale normally")
       end
     elseif cmd == "uiinfo" then
       LAYOUT.compute()
       local r = LAYOUT.raw or {}
       out(("gui: %s x %s  scale %s"):format(tostring(r[1]), tostring(r[2]), tostring(r[3])))
       out(("using %d x %d"):format(LAYOUT.W, LAYOUT.H))
-      out("box scale " .. UI.rectX)
+      out("box scale " .. boxScale())
     elseif cmd == "uiwidth" then
       local w, h = tonumber(words[2]), tonumber(words[3])
       if w and h then
