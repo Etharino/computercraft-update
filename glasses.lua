@@ -8,7 +8,6 @@ local PLAYER_RANGE = 48
 local MAX_BOXES    = 300
 local SCAN_EVERY   = 3      -- seconds, only while block highlights are on
 local COMPASS_EVERY = 0.1
-local STATUS_EVERY  = 0.5
 local WAYPOINT_FILE = "/.waypoints"
 
 local PALETTE = {
@@ -135,21 +134,19 @@ end
 -- HUD panel
 ---------------------------------------------------------------------
 local HELMET = {
-  plate = 0x100F17, edge = 0x62302B, gold = 0xFFC16A,
-  glow = 0x77F0FF, faint = 0x7996A6, alarm = 0xFF5958,
+  panel = 0x100F18, outline = 0x642F2F, gold = 0xFFC16A,
+  cyan = 0x8EF4FF, dim = 0xA1BDCF, red = 0xFF5358,
 }
-local SCREEN_W, SCREEN_H = 400, 240
-local PANEL_W = 154
-local STATUS_X, STATUS_Y = 12, 100
-local NAV_X, NAV_Y = 234, 100
-local COMPASS_Y = 9
-local tape, tapeLabels = {}, {}
-local compassYaw, compassTarget
+local screenW, screenH = 400, 240
+local cardW, cardY = 142, 150
+local TAPE_Y = 10
+local ticks, captions = {}, {}
+local lastBearing, lastTarget
 
-local function text(x, y, content, color, centered, size)
+local function text(x, y, content, color, center, size)
   return try(overlay.createText, {
     gui = true, x = x, y = y, content = content, color = color,
-    center = centered == true, fontSize = size or 1, shadow = true,
+    center = center == true, fontSize = size or 0.9, shadow = true,
   })
 end
 
@@ -161,86 +158,81 @@ local function rect(x, y, w, h, color, opacity, angle)
 end
 
 local function readScreen()
-  local width, height, scale = try(overlay.getGuiSize)
-  if not width or not height or width <= 0 or height <= 0 then return SCREEN_W, SCREEN_H end
-  return math.ceil(width / math.max(1, scale or 1)), math.ceil(height / math.max(1, scale or 1))
+  local w, h, scale = try(overlay.getGuiSize)
+  if not w or not h or w <= 0 or h <= 0 then return screenW, screenH end
+  return math.ceil(w / math.max(1, scale or 1)), math.ceil(h / math.max(1, scale or 1))
 end
 
-local function plate(prefix, x, y, w, title)
-  hud[prefix .. "bg"] = rect(x, y, w, 66, HELMET.plate, 0.77)
-  hud[prefix .. "rail"] = rect(x, y, w - 11, 1, HELMET.gold, 0.92)
-  hud[prefix .. "angle"] = rect(x + w - 13, y + 4, 13, 1, HELMET.gold, 0.92, 42)
-  hud[prefix .. "side"] = rect(x, y + 1, 1, 65, HELMET.edge, 0.95)
-  hud[prefix .. "foot"] = rect(x, y + 65, w - 9, 1, HELMET.edge, 0.95)
-  hud[prefix .. "title"] = text(x + 8, y + 7, title, HELMET.gold, false, 0.9)
+local function buildPlate(key, x, y, title, mirrored)
+  local rail = mirrored and x + 17 or x
+  local edge = mirrored and x + cardW - 1 or x
+  local angleX = mirrored and x + 1 or x + cardW - 17
+  hud[key .. "Bg"] = rect(x, y, cardW, 67, HELMET.panel, 0.83)
+  hud[key .. "Rail"] = rect(rail, y, cardW - 17, 1, HELMET.gold, 0.92)
+  hud[key .. "Angle"] = rect(angleX, y + 5, 17, 1, HELMET.gold, 0.95, mirrored and -40 or 40)
+  hud[key .. "Edge"] = rect(edge, y + 12, 1, 55, HELMET.outline, 1)
+  hud[key .. "Foot"] = rect(x, y + 66, cardW, 1, HELMET.outline, 1)
+  hud[key .. "Title"] = text(x + (mirrored and 20 or 9), y + 7, title, HELMET.gold)
 end
 
 local function buildHud()
-  for _, o in pairs(hud) do removeObj(o) end
-  hud, tape, tapeLabels = {}, {}, {}
-  compassYaw, compassTarget = nil, nil
+  for _, object in pairs(hud) do removeObj(object) end
+  hud, ticks, captions = {}, {}, {}
+  lastBearing, lastTarget = nil, nil
   if not hudShown then return end
 
-  SCREEN_W, SCREEN_H = readScreen()
-  local cx = SCREEN_W / 2
-  PANEL_W = math.min(154, math.floor((SCREEN_W - 30) / 2))
-  STATUS_X, NAV_X = 9, SCREEN_W - PANEL_W - 9
-  STATUS_Y = math.max(49, SCREEN_H - 94)
-  NAV_Y = STATUS_Y
+  screenW, screenH = readScreen()
+  cardW = math.max(60, math.min(159, math.floor((screenW - 40) / 2)))
+  cardY = math.max(49, screenH - 96)
+  local cx, cy = screenW / 2, screenH / 2
+  local left, right = 10, screenW - cardW - 10
 
-  local x, y, w = STATUS_X, STATUS_Y, PANEL_W
-  plate("suit", x, y, w, "SUIT STATUS")
-  if w >= 112 then hud.clock = text(x + w - 37, y + 7, "", HELMET.faint, false, 0.85) end
-  hud.vitals = text(x + 8, y + 22, "", HELMET.glow)
-  hud.hpBase = rect(x + 8, y + 36, w - 16, 3, HELMET.edge, 1)
-  hud.hpBar  = rect(x + 8, y + 36, w - 16, 3, HELMET.glow, 1)
-  hud.supply = text(x + 8, y + 47, "", HELMET.gold, false, 0.9)
-  for i = 1, 7 do
-    hud["healthGap" .. i] = rect(x + 8 + (w - 16) * i / 8, y + 36, 1, 3, HELMET.plate, 1)
+  buildPlate("suit", left, cardY, "SUIT STATUS", false)
+  hud.vitals = text(left + 9, cardY + 21, "", HELMET.cyan, false, 1.05)
+  hud.speed = text(left + cardW - 55, cardY + 22, "", HELMET.dim, false, 0.82)
+  hud.hpBase = rect(left + 9, cardY + 35, cardW - 18, 4, HELMET.outline, 1)
+  hud.hpBar = rect(left + 9, cardY + 35, cardW - 18, 4, HELMET.cyan, 1)
+  for i = 1, 9 do
+    hud["gap" .. i] = rect(left + 9 + i * (cardW - 18) / 10, cardY + 35, 1, 4, HELMET.panel, 1)
   end
+  hud.supply = text(left + 9, cardY + 49, "", HELMET.gold)
 
-  x, y = NAV_X, NAV_Y
-  plate("nav", x, y, w, "NAVIGATION")
-  hud.pos   = text(x + 8, y + 22, "", HELMET.faint, false, 0.9)
-  hud.nav   = text(x + 8, y + 36, "", HELMET.glow, false, 0.9)
-  hud.guide = text(x + 8, y + 50, "", HELMET.glow, false, 0.9)
+  buildPlate("route", right, cardY, "NAVIGATION", true)
+  hud.pos = text(right + 9, cardY + 21, "", HELMET.dim, false, 0.82)
+  hud.nav = text(right + 9, cardY + 34, "", HELMET.cyan, false, 0.96)
+  hud.guide = text(right + 9, cardY + 50, "", HELMET.cyan, false, 0.82)
 
-  local tw = math.min(204, SCREEN_W - 22)
-  local left = cx - tw / 2
-  hud.tapeBg = rect(left, COMPASS_Y, tw, 31, HELMET.plate, 0.72)
-  hud.tapeRail = rect(left + 4, COMPASS_Y + 30, tw - 8, 1, HELMET.edge, 0.93)
-  hud.tapeLeft = rect(left, COMPASS_Y + 22, 11, 1, HELMET.gold, 1, 40)
-  hud.tapeRight = rect(left + tw - 11, COMPASS_Y + 22, 11, 1, HELMET.gold, 1, -40)
-  hud.index = rect(cx - 0.5, COMPASS_Y + 23, 1, 9, HELMET.gold, 1)
-  hud.heading = text(cx, COMPASS_Y + 35, "", HELMET.gold, true, 1.05)
-  hud.target = text(cx, COMPASS_Y + 1, "", HELMET.glow, true, 0.82)
-
-  for bearing = 0, 345, 15 do
-    local cardinal = bearing % 45 == 0
-    local tick = rect(cx, COMPASS_Y + 24, 1, cardinal and 8 or 4, HELMET.faint, 0.95)
-    tape[bearing], hud["tick" .. bearing] = tick, tick
-    if cardinal then
-      local caption = text(cx, COMPASS_Y + 12, "", HELMET.glow, true, 0.8)
-      tapeLabels[bearing], hud["bearing" .. bearing] = caption, caption
+  local width = math.min(210, screenW - 24)
+  hud.tapeBg = rect(cx - width / 2, TAPE_Y, width, 29, HELMET.panel, 0.75)
+  hud.tapeRail = rect(cx - width / 2 + 8, TAPE_Y + 27, width - 16, 1, HELMET.outline, 0.96)
+  hud.heading = text(cx, TAPE_Y + 31, "", HELMET.gold, true, 1.08)
+  hud.target = text(cx, TAPE_Y + 1, "", HELMET.cyan, true, 0.85)
+  for angle = 0, 345, 15 do
+    local major = angle % 45 == 0
+    local tick = rect(cx, TAPE_Y + 23, 1, major and 7 or 3, HELMET.dim, 0.8)
+    ticks[angle], hud["tick" .. angle] = tick, tick
+    if major then
+      local caption = text(cx, TAPE_Y + 11, "", HELMET.cyan, true, 0.84)
+      captions[angle], hud["bearing" .. angle] = caption, caption
     end
   end
+  hud.index = rect(cx - 0.5, TAPE_Y + 24, 1, 7, HELMET.gold, 1)
 
-  local cy = SCREEN_H / 2
-  hud.reticleLeft = rect(cx - 14, cy - 0.5, 5, 1, HELMET.gold, 0.8)
-  hud.reticleRight = rect(cx + 9, cy - 0.5, 5, 1, HELMET.gold, 0.8)
-  hud.reticleTop = rect(cx - 0.5, cy - 13, 1, 4, HELMET.gold, 0.7)
-  hud.reticleBottom = rect(cx - 0.5, cy + 9, 1, 4, HELMET.gold, 0.7)
-  hud.msg = text(cx, math.min(cy + 24, SCREEN_H - 25), "", HELMET.gold, true, 0.9)
+  hud.reticleLeft = rect(cx - 15, cy - 1, 6, 1, HELMET.gold, 0.77)
+  hud.reticleRight = rect(cx + 9, cy - 1, 6, 1, HELMET.gold, 0.77)
+  hud.reticleTop = rect(cx - 0.5, cy - 13, 1, 4, HELMET.cyan, 0.76)
+  hud.reticleBottom = rect(cx - 0.5, cy + 9, 1, 4, HELMET.cyan, 0.76)
+  hud.warning = text(cx, cy - 30, "", HELMET.red, true, 1)
+  hud.msg = text(cx, cy + 24, "", HELMET.gold, true, 0.86)
 end
 
--- Keep ordinary status strings within the width of the side plates.
 local textCache = setmetatable({}, {__mode = "k"})
 local function set(obj, content, color, limit)
   if not obj then return end
-  if type(content) == "string" then content = shorten(content, limit or math.floor((PANEL_W - 14) / 5.6)) end
+  content = shorten(content, limit or math.max(9, math.floor((cardW - 18) / 5)))
   local old = textCache[obj]
   if not old or old[1] ~= content then pcall(obj.setContent, content) end
-  if color and (not old or old[2] ~= color) and obj.setColor then pcall(obj.setColor, color) end
+  if color and (not old or old[2] ~= color) then try(obj.setColor, color) end
   textCache[obj] = {content, color}
 end
 
@@ -751,125 +743,156 @@ local function handle(input)
   return true
 end
 
-local compassLabels = {
+---------------------------------------------------------------------
+-- Loops
+---------------------------------------------------------------------
+local compassPoint = {
   [0] = "N", [45] = "NE", [90] = "E", [135] = "SE",
   [180] = "S", [225] = "SW", [270] = "W", [315] = "NW",
 }
 
+local function signedAngle(angle)
+  return (angle + 180) % 360 - 180
+end
+
 local function drawCompass(owner)
   if type(owner.yaw) ~= "number" then
-    if compassYaw ~= false then
-      for _, tick in pairs(tape) do try(tick.setEnabled, false) end
-      for _, caption in pairs(tapeLabels) do try(caption.setEnabled, false) end
-      compassYaw, compassTarget = false, nil
-      set(hud.target, "")
+    if lastBearing ~= false then
+      for _, tick in pairs(ticks) do try(tick.setEnabled, false) end
+      for _, caption in pairs(captions) do try(caption.setEnabled, false) end
+      lastBearing, lastTarget = false, nil
     end
-    set(hud.heading, "HEADING --", HELMET.faint)
+    set(hud.heading, "HEADING --", HELMET.dim)
+    set(hud.target, "")
     return
   end
-
   local bearing = (owner.yaw + 180) % 360
-  local targetBearing
+  local target
   if navTarget and owner.x and navTarget.dimension == owner.dimension then
-    local dx, dz = navTarget.x + 0.5 - owner.x, navTarget.z + 0.5 - owner.z
-    targetBearing = (math.deg(atan2(-dx, dz)) + 180) % 360
+    target = (math.deg(atan2(owner.x - navTarget.x - 0.5, navTarget.z + 0.5 - owner.z)) + 180) % 360
   end
-  if compassYaw == bearing and compassTarget == targetBearing then return end
-  compassYaw, compassTarget = bearing, targetBearing
-
-  local cx = SCREEN_W / 2
-  local usableHalf = math.max(1, math.min(92, cx - 18))
-  local pixelsPerDegree = usableHalf / 84
-  for tickBearing = 0, 345, 15 do
-    local angle = (tickBearing - bearing + 540) % 360 - 180
-    local offset = angle * pixelsPerDegree
-    local labelText = compassLabels[tickBearing]
-    local shown = math.abs(offset) <= usableHalf
-    local tick, caption = tape[tickBearing], tapeLabels[tickBearing]
-    if tick then
-      try(tick.setEnabled, shown)
-      if shown then try(tick.setPos, cx + offset, COMPASS_Y + 25, 0) end
-    end
+  if bearing == lastBearing and target == lastTarget then return end
+  lastBearing, lastTarget = bearing, target
+  local cx = screenW / 2
+  local range = math.max(1, math.min(92, cx - 22))
+  for angle, tick in pairs(ticks) do
+    local offset = signedAngle(angle - bearing) * range / 84
+    local visible = math.abs(offset) <= range
+    try(tick.setEnabled, visible)
+    if visible then try(tick.setPos, cx + offset, TAPE_Y + 24, 0) end
+    local caption = captions[angle]
     if caption then
-      try(caption.setEnabled, shown)
-      if shown then
-        try(caption.setPos, cx + offset, COMPASS_Y + 13, 0)
-        set(caption, labelText, labelText == "N" and HELMET.alarm or HELMET.glow)
+      try(caption.setEnabled, visible)
+      if visible then
+        try(caption.setPos, cx + offset, TAPE_Y + 13, 0)
+        set(caption, compassPoint[angle], angle == 0 and HELMET.red or HELMET.cyan)
       end
     end
   end
-
   set(hud.heading, ("%03d  %s"):format(math.floor(bearing + 0.5) % 360, facingName(owner.yaw)), HELMET.gold)
-  if targetBearing and hud.target then
-    local relative = (targetBearing - bearing + 540) % 360 - 180
-    local offset = relative * pixelsPerDegree
-    local position = math.max(-usableHalf + 5, math.min(usableHalf - 5, offset))
-    try(hud.target.setPos, cx + position, COMPASS_Y + 2, 0)
-    set(hud.target, offset > usableHalf and ">" or offset < -usableHalf and "<" or "V", HELMET.glow)
+  if target and hud.target then
+    local offset = signedAngle(target - bearing) * range / 84
+    try(hud.target.setPos, cx + math.max(-range, math.min(range, offset)), TAPE_Y + 1, 0)
+    set(hud.target, offset > range and ">" or offset < -range and "<" or "V", HELMET.cyan)
   else
     set(hud.target, "")
   end
 end
 
----------------------------------------------------------------------
--- Loops
----------------------------------------------------------------------
+local function drawMotion(owner, x, y, z, speed, closing)
+  -- Speed is sampled across HUD updates, and closing speed includes vertical movement.
+  set(hud.speed, cardW >= 105 and ("%3.1f m/s"):format(speed) or "", HELMET.dim)
+  local ratio = owner.health and owner.maxHealth and owner.maxHealth > 0
+    and math.max(0, math.min(1, owner.health / owner.maxHealth))
+  if ratio then
+    local tint = ratio <= 0.30 and HELMET.red or (ratio <= 0.55 and HELMET.gold or HELMET.cyan)
+    set(hud.vitals, ("HP %d/%d"):format(math.floor(owner.health), math.floor(owner.maxHealth)), tint)
+    local width = (cardW - 18) * ratio
+    if hud.hpBar then
+      try(hud.hpBar.setSizeX, width)
+      try(hud.hpBar.setPos, 19 + width / 2, cardY + 37, 0)
+      try(hud.hpBar.setColor, tint)
+    end
+  else
+    set(hud.vitals, "HP --", HELMET.dim)
+    if hud.hpBar then try(hud.hpBar.setSizeX, 0) end
+  end
+
+  local warning = ""
+  if owner.isInLava then
+    warning = "LAVA"
+  elseif owner.isUnderWater and owner.airSupply and owner.airSupply < 100 then
+    warning = "LOW OXYGEN"
+  elseif ratio and ratio <= 0.30 then
+    warning = "CRITICAL HEALTH"
+  end
+  set(hud.warning, warning, HELMET.red, 30)
+  drawSupplies(owner)
+
+  if x then set(hud.pos, ("%d %d %d"):format(math.floor(x), math.floor(y), math.floor(z)), HELMET.dim)
+  else set(hud.pos, "Position unavailable", HELMET.dim) end
+  if navTarget and owner.dimension and navTarget.dimension ~= owner.dimension then
+    if next(groups.waypoint) then clearGroup("waypoint") end
+    set(hud.nav, navTarget.name, HELMET.gold)
+    set(hud.guide, "Go to " .. plain(navTarget.dimension), HELMET.gold)
+  elseif navTarget and x then
+    if not groups.waypoint[navTarget.name] then
+      groups.waypoint[navTarget.name] = beacon(navTarget.x, navTarget.y, navTarget.z,
+        navTarget.color or COLOR.waypoint, navTarget.name)
+    end
+    local dx, dz = navTarget.x + 0.5 - x, navTarget.z + 0.5 - z
+    local distance = math.sqrt(dx * dx + dz * dz + (navTarget.y - y)^2)
+    local dy = navTarget.y - math.floor(y)
+    local height = dy > 0 and (" / up " .. dy) or (dy < 0 and (" / down " .. -dy) or "")
+    local eta = closing >= 0.75 and distance >= 2 and distance / closing
+    local suffix = eta and eta < 600 and (" / %ds"):format(math.ceil(eta)) or ""
+    local distanceText = ("%dm%s"):format(math.floor(distance + 0.5), suffix)
+    local name = shorten(navTarget.name, math.max(4, math.floor((cardW - 18) / 5) - #distanceText - 2))
+    set(hud.nav, name .. "  " .. distanceText, HELMET.cyan)
+    set(hud.guide, distance < 1.5 and "Arrived" or relativeDir(dx, dz, owner.yaw) .. height, HELMET.cyan)
+  else
+    set(hud.nav, "No waypoint", HELMET.dim)
+    set(hud.guide, #nearbyNames > 0 and ("Nearby: " .. nearbyNames[1]) or "", HELMET.dim)
+  end
+end
+
 local function infoLoop()
-  local lastBar, lastRatio, nextStatus = nil, nil, 0
+  local nextStatus, lastSample = 0, nil
+  local speed, closing = 0, 0
   while true do
     if hudShown then
-      local o = me()
-      local now = os.clock()
-      if now >= nextStatus then
-        nextStatus = now + STATUS_EVERY
+      local owner = me()
+      local time = os.clock()
+      if time >= nextStatus then
+        nextStatus = time + 0.5
         local w, h = readScreen()
-        if countObjects() > (try(overlay.getObjectsCount) or 1e9) then rebuildAll()
-        elseif SCREEN_W ~= w or SCREEN_H ~= h then buildHud() end
-      end
-      drawCompass(o)
-      local x, y, z = myPos(o)
-      if x then
-        set(hud.pos, ("%d %d %d  [%s]"):format(math.floor(x), math.floor(y), math.floor(z),
-            o.yaw and facingName(o.yaw) or "?"))
-      end
-      local hp = (o.health and o.maxHealth) and ("HP %d/%d"):format(math.floor(o.health), math.floor(o.maxHealth)) or "HP ?"
-      local act = {}
-      if blockTargets then act[#act + 1] = "blocks" end
-      if showPlayers then act[#act + 1] = "players" end
-      if dark then act[#act + 1] = "dark" end
-      local ratio = o.health and o.maxHealth and o.maxHealth > 0 and math.max(0, math.min(1, o.health / o.maxHealth)) or 0
-      local tint = ratio <= 0.30 and COLOR.bad or (ratio <= 0.55 and COLOR.warn or 0x73F2E5)
-      set(hud.vitals, hp .. (#act > 0 and (" / " .. table.concat(act, "+")) or ""), tint)
-      local width = (PANEL_W - 16) * ratio
-      if hud.hpBar and (lastBar ~= hud.hpBar or lastRatio ~= ratio) then
-        lastBar, lastRatio = hud.hpBar, ratio
-        try(hud.hpBar.setSizeX, width)
-        try(hud.hpBar.setPos, STATUS_X + 8 + width / 2, STATUS_Y + 37.5, 0)
-        try(hud.hpBar.setColor, tint)
-      end
-      set(hud.clock, textutils.formatTime(os.time(), true))
-      drawSupplies(o)
-      local dimension = o.dimension or "?"
-      if navTarget and navTarget.dimension ~= dimension then
-        if next(groups.waypoint) then clearGroup("waypoint") end
-        set(hud.nav, navTarget.name, COLOR.warn)
-        set(hud.guide, "Go to " .. plain(navTarget.dimension), COLOR.warn)
-      elseif navTarget and x then
-        if not groups.waypoint[navTarget.name] then
-          groups.waypoint[navTarget.name] = beacon(navTarget.x, navTarget.y, navTarget.z,
-            navTarget.color or COLOR.waypoint, navTarget.name)
+        if countObjects() > (try(overlay.getObjectsCount) or math.huge) then rebuildAll()
+        elseif screenW ~= w or screenH ~= h then buildHud() end
+        local x, y, z = myPos(owner)
+        if x and owner.dimension then
+          local target = navTarget and navTarget.dimension == owner.dimension and navTarget or nil
+          local distance = target and math.sqrt((target.x + 0.5 - x)^2 + (target.y - y)^2 + (target.z + 0.5 - z)^2)
+          if lastSample and lastSample.dimension == owner.dimension and time > lastSample.time and time - lastSample.time <= 2 then
+            local dt = time - lastSample.time
+            local travel = math.sqrt((x - lastSample.x)^2 + (y - lastSample.y)^2 + (z - lastSample.z)^2)
+            local measured = travel / dt
+            speed = measured <= 120 and speed * 0.4 + measured * 0.6 or 0
+            closing = measured <= 120 and distance and lastSample.target == target
+              and (lastSample.distance - distance) / dt or 0
+          else
+            speed, closing = 0, 0
+          end
+          lastSample = {x = x, y = y, z = z, time = time, dimension = owner.dimension,
+            target = target, distance = distance}
+        else
+          lastSample, speed, closing = nil, 0, 0
         end
-        local dx, dz = navTarget.x + 0.5 - x, navTarget.z + 0.5 - z
-        local dist = math.floor(math.sqrt(dx * dx + dz * dz + (navTarget.y - y) ^ 2) + 0.5)
-        local dy = navTarget.y - math.floor(y)
-        local height = dy > 0 and (" / up " .. dy) or (dy < 0 and (" / down " .. -dy) or "")
-        set(hud.nav, ("%s  %dm"):format(shorten(navTarget.name, 15), dist), COLOR.waypoint)
-        set(hud.guide, dist <= 1 and "Arrived" or (relativeDir(dx, dz, o.yaw) .. height), COLOR.nav)
-      else
-        set(hud.nav, #nearbyNames > 0 and ("near: " .. table.concat(nearbyNames, ", ")) or "")
-        set(hud.guide, "")
+        drawMotion(owner, x, y, z, speed, closing)
+        if nowMs() > msgUntil then set(hud.msg, "") end
       end
-      if os.epoch("utc") > msgUntil then set(hud.msg, "") end
+      drawCompass(owner)
+    else
+      nextStatus, lastSample, speed, closing = 0, nil, 0, 0
     end
     sleep(COMPASS_EVERY)
   end
