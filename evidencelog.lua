@@ -133,6 +133,7 @@ local STATS = {
   dmg = 0, heal = 0, deaths = 0,       -- health changes
   seen = {}, seenCount = 0,            -- different players met
   oresNear = 0, bestOre = nil,         -- from the latest block scan
+  speed = 0, stacks = nil,             -- current speed, inventory stacks
 }
 local function out(s, color)
   s = tostring(s)
@@ -369,19 +370,13 @@ function LAYOUT.compute()
 end
 
 -- Card geometry (shared look for every card)
-local CARD = {}
-function CARD.W() return U(150) end
-function CARD.HDR() return U(13) end
-function CARD.ROW() return U(11) end
-function CARD.PADY() return U(4) end
+-- MekaSuit-helmet style: thin glowing cyan text straight over the world,
+-- no panels. Change the colour here if you like.
+local MEKA = { main = 0x3CF0E6, dim = 0x2A9C96, faint = 0x184B48 }
 
-local SROWS = {
-  { key = "time",  label = "TIME"  },
-  { key = "dist",  label = "DIST"  },
-  { key = "items", label = "ITEMS" },
-  { key = "ores",  label = "ORES"  },
-  { key = "mgr",   label = "MGR"   },
-}
+local SLINES = { "hp", "inv", "spd", "dist", "ores", "mgr" }
+local LABELS = { hp = "HP", inv = "INV", spd = "SPD", dist = "DIST", ores = "ORES", mgr = "MGR" }
+local BAR_SEGS = 12
 local rowValues = {}
 
 local function removeObject(o)
@@ -413,73 +408,89 @@ local function setColor(obj, color)
   if obj and type(obj.setColor) == "function" then pcall(obj.setColor, color) end
 end
 
--- A card: dark body, coloured header, accent edge, faint zebra rows.
-local function card(list, x, y, w, rows, title, accent)
-  local h = CARD.HDR() + rows * CARD.ROW() + CARD.PADY()
-  list[#list + 1] = rect(x, y, w, h, COLOR.panel, 0.82)
-  list[#list + 1] = rect(x, y, w, CARD.HDR(), COLOR.header, 0.92)
-  list[#list + 1] = rect(x, y, U(2), h, accent or COLOR.accent, 1)
-  for i = 2, rows, 2 do
-    list[#list + 1] = rect(x + U(2), y + CARD.HDR() + U(1.5) + (i - 1) * CARD.ROW(), w - U(2), CARD.ROW(), 0xFFFFFF, 0.05)
-  end
-  list[#list + 1] = text(x + U(7), y + U(3), title, accent or COLOR.accent)
-  return h
-end
-local function rowY(y, i) return y + CARD.HDR() + U(3) + (i - 1) * CARD.ROW() end
-
--- Moving an existing object: overlay objects animate from x=0 when they
--- are CREATED, so everything that changes is created once and then moved
--- or re-texted in place. These try the setter names different AP builds use.
+-- Moving an existing object: overlay objects animate from 0 when they are
+-- CREATED, so things that change are created once and moved in place.
 local function moveX(obj, x)
   if not obj then return false end
   if type(obj.setX) == "function" then return (pcall(obj.setX, x)) end
-  if type(obj.setPosition) == "function" then return (pcall(obj.setPosition, x, obj.getY and select(2, pcall(obj.getY)) or 0)) end
+  return false
+end
+local function moveXY(obj, x, y)
+  if not obj then return false end
+  if type(obj.setX) == "function" and type(obj.setY) == "function" then
+    return (pcall(obj.setX, x)) and (pcall(obj.setY, y))
+  end
+  if type(obj.setPosition) == "function" then return (pcall(obj.setPosition, x, y)) end
   return false
 end
 
-local function NAV_H() return CARD.HDR() + 4 * CARD.ROW() + CARD.PADY() end
+local function LH() return U(11) end
 local CONTACT_ROWS = 4
 
--- Left column: STATS card, then NAV (toolkit), then CONTACTS.
 function HUD.build()
   if not HW.overlay then return end
   LAYOUT.compute()
-  local P, list = HUD.parts, {}
-  local x, y, W = U(4), U(4), CARD.W()
-  HUD.statusH = card(list, x, y, W, #SROWS, "STATS", COLOR.accent)
-  for i, o in ipairs(list) do P["c" .. i] = o end
-  if SETTINGS.EVIDENCE then P.dot = text(x + W - U(24), y + U(3), "REC", COLOR.bad) end
-  for i, row in ipairs(SROWS) do
-    P["l_" .. row.key] = text(x + U(7), rowY(y, i), row.label, COLOR.label)
-    P["v_" .. row.key] = text(x + U(44), rowY(y, i), rowValues[row.key] and rowValues[row.key][1] or "-",
-                             rowValues[row.key] and rowValues[row.key][2] or COLOR.text)
+  local P = HUD.parts
+  local x, y = U(10), U(9)
+  -- corner bracket
+  P.br1 = rect(U(3), U(3), U(12), U(1), MEKA.main, 0.9)
+  P.br2 = rect(U(3), U(3), U(1), U(12), MEKA.main, 0.9)
+  if SETTINGS.EVIDENCE then P.dot = text(x + U(110), U(3), "REC", COLOR.bad) end
+  local valX = x + U(30)
+  for i, key in ipairs(SLINES) do
+    local ly = y + (i - 1) * LH()
+    P["l_" .. key] = text(x, ly, LABELS[key], MEKA.dim)
+    local rv = rowValues[key]
+    if key == "hp" or key == "inv" then
+      -- number first, bar after it: nothing to the right of the bar can collide
+      P["v_" .. key]  = text(valX, ly, rv and rv[1] or "", rv and rv[2] or MEKA.main)
+      P["bb_" .. key] = text(valX + U(34), ly, string.rep("|", BAR_SEGS), MEKA.faint)
+      P["bf_" .. key] = text(valX + U(34), ly, rv and rv.bar or "", rv and rv[2] or MEKA.main)
+    else
+      P["v_" .. key]  = text(valX, ly, rv and rv[1] or "-", rv and rv[2] or MEKA.main)
+    end
   end
+  HUD.listBottom = y + #SLINES * LH()
 
-  -- CONTACTS: fixed card; rows are re-texted, never recreated
-  local cy = y + HUD.statusH + U(5) + NAV_H() + U(5)
+  -- contacts, right under the readout
+  local cy = HUD.listBottom + U(6)
   local cl = {}
-  card(cl, x, cy, W, CONTACT_ROWS, "CONTACTS", COLOR.good)
-  HUD.cpool = { edge = cl[3], title = cl[#cl], rows = {} }
-  HUD.cpool.count = text(x + W - U(16), cy + U(3), "0", COLOR.good)
+  cl[1] = rect(x, cy - U(2), U(110), U(1), MEKA.faint, 0.9)
+  cl[2] = text(x, cy, "CONTACTS", MEKA.dim)
+  HUD.cpool = { title = cl[2], rows = {} }
+  HUD.cpool.count = text(x + U(52), cy, "0", MEKA.main)
   cl[#cl + 1] = HUD.cpool.count
   for i = 1, CONTACT_ROWS do
+    local ry = cy + i * LH()
     local r = {
-      arrow = text(x + U(7), rowY(cy, i), "", COLOR.text),
-      name  = text(x + U(16), rowY(cy, i), i == 1 and "all clear" or "", COLOR.label),
-      dist  = text(x + W - U(32), rowY(cy, i), "", COLOR.text),
+      arrow = text(x, ry, "", MEKA.main),
+      name  = text(x + U(9), ry, i == 1 and "all clear" or "", MEKA.dim),
+      dist  = text(x + U(88), ry, "", MEKA.main),
     }
     HUD.cpool.rows[i] = r
     cl[#cl + 1] = r.arrow; cl[#cl + 1] = r.name; cl[#cl + 1] = r.dist
   end
   HUD.contacts = cl
 end
-function HUD.leftBottom() return U(4) + (HUD.statusH or U(72)) + U(5) end
+function HUD.leftBottom() return HUD.listBottom or U(80) end
 
 function HUD.row(key, value, color)
-  value = shorten(value, 17)
-  rowValues[key] = { value, color or COLOR.text }
+  value = shorten(value, 20)
+  local rv = rowValues[key] or {}
+  rv[1], rv[2] = value, color or MEKA.main
+  rowValues[key] = rv
   local obj = HUD.parts["v_" .. key]
-  if obj then setText(obj, value); setColor(obj, color or COLOR.text) end
+  if obj then setText(obj, value); setColor(obj, rv[2]) end
+end
+
+-- charge-style bar: frac 0..1
+function HUD.bar(key, frac, value, color)
+  local n = math.max(0, math.min(BAR_SEGS, math.floor((frac or 0) * BAR_SEGS + 0.5)))
+  local bar = string.rep("|", n)
+  HUD.row(key, value, color)
+  rowValues[key].bar = bar
+  local obj = HUD.parts["bf_" .. key]
+  if obj then setText(obj, bar); setColor(obj, color or MEKA.main) end
 end
 
 -- list: { { name, dist, arrow, ally }, ... }  -> updates the fixed rows
@@ -488,10 +499,7 @@ function HUD.drawContacts(list)
   if not cp then return end
   local hostile = 0
   for _, c in ipairs(list) do if not c.ally then hostile = hostile + 1 end end
-  local accent = hostile > 0 and COLOR.bad or COLOR.good
-  setText(cp.count, tostring(#list)); setColor(cp.count, accent)
-  setColor(cp.title, accent)
-  if cp.edge and type(cp.edge.setColor) == "function" then pcall(cp.edge.setColor, accent) end
+  setText(cp.count, tostring(#list)); setColor(cp.count, hostile > 0 and COLOR.bad or MEKA.main)
   for i = 1, CONTACT_ROWS do
     local r, c = cp.rows[i], list[i]
     if c then
@@ -500,17 +508,17 @@ function HUD.drawContacts(list)
       local d = c.dist and (math.floor(c.dist) .. "m") or "?"
       if i == CONTACT_ROWS and #list > CONTACT_ROWS then d = "+" .. (#list - CONTACT_ROWS + 1) end
       setText(r.arrow, c.arrow); setColor(r.arrow, col)
-      setText(r.name, shorten(c.name, 12)); setColor(r.name, col)
+      setText(r.name, shorten(c.name, 13)); setColor(r.name, col)
       setText(r.dist, d)
     else
       setText(r.arrow, "")
-      setText(r.name, (i == 1 and #list == 0) and "all clear" or ""); setColor(r.name, COLOR.label)
+      setText(r.name, (i == 1 and #list == 0) and "all clear" or ""); setColor(r.name, MEKA.dim)
       setText(r.dist, "")
     end
   end
 end
 
--- Toast just above the crosshair (one at a time, sized to the message)
+-- Toast just above the crosshair: [ message ] with thin cyan brackets
 function HUD.alert(message, color)
   HUD.alertUntil = nowMs() + SETTINGS.ALERT_SECONDS * 1000
   if not HW.overlay then return end
@@ -518,26 +526,18 @@ function HUD.alert(message, color)
   for _, o in ipairs(HUD.toast) do removeObject(o) end
   HUD.toast = {}
   if HUD.shown then
-    local maxChars = 30
-    local lines, cur = {}, ""
-    for word in tostring(message):gmatch("%S+") do
-      if #cur == 0 then cur = word
-      elseif #cur + 1 + #word <= maxChars then cur = cur .. " " .. word
-      else lines[#lines + 1] = cur; cur = word end
-    end
-    if #cur > 0 then lines[#lines + 1] = cur end
-    if #lines > 2 then lines = { lines[1], shorten(table.concat(lines, " ", 2), maxChars) } end
-    for i, l in ipairs(lines) do lines[i] = shorten(l, maxChars) end
-    local longest = 0
-    for _, l in ipairs(lines) do longest = math.max(longest, #l) end
-    local w, h = longest * U(6) + U(14), #lines * U(10) + U(5)
-    local x, y = LAYOUT.W / 2 - w / 2, LAYOUT.H / 2 - 24 - h
+    local msg = shorten(tostring(message), 40)
+    local w, h = #msg * U(6) + U(12), U(13)
+    local x, y = LAYOUT.W / 2 - w / 2, LAYOUT.H / 2 - 26 - h
     color = color or COLOR.bad
-    HUD.toast[#HUD.toast + 1] = rect(x, y, w, h, COLOR.panel, 0.85)
-    HUD.toast[#HUD.toast + 1] = rect(x, y, U(2), h, color, 1)
-    for i, l in ipairs(lines) do
-      HUD.toast[#HUD.toast + 1] = text(x + U(7), y + U(3) + (i - 1) * U(10), l, color)
-    end
+    HUD.toast[#HUD.toast + 1] = rect(x, y, w, h, 0x000000, 0.35)
+    HUD.toast[#HUD.toast + 1] = rect(x, y, U(1), h, MEKA.main, 1)
+    HUD.toast[#HUD.toast + 1] = rect(x + w - U(1), y, U(1), h, MEKA.main, 1)
+    HUD.toast[#HUD.toast + 1] = rect(x, y, U(4), U(1), MEKA.main, 1)
+    HUD.toast[#HUD.toast + 1] = rect(x, y + h - U(1), U(4), U(1), MEKA.main, 1)
+    HUD.toast[#HUD.toast + 1] = rect(x + w - U(4), y, U(4), U(1), MEKA.main, 1)
+    HUD.toast[#HUD.toast + 1] = rect(x + w - U(4), y + h - U(1), U(4), U(1), MEKA.main, 1)
+    HUD.toast[#HUD.toast + 1] = text(x + U(6), y + U(3), msg, color)
   end
   try(HW.overlay.update); try(HW.overlay.setAutoUpdate, true)
 end
@@ -901,6 +901,7 @@ local function checkInventory()
     return
   end
   warnedNoInventory = false
+  STATS.stacks = #list
   local now, total = countItems(list)
   if not before then before, beforeTotal = now, total; return end
 
@@ -965,23 +966,32 @@ local function refreshRows()
     return rel > 0 and ">" or "<"
   end
 
-  local up = math.floor((nowMs() - STATS.started) / 1000)
-  HUD.row("time", ("%dh %02dm  day %d"):format(math.floor(up / 3600), math.floor(up / 60) % 60, os.day and os.day() or 0), COLOR.text)
-  HUD.row("dist", ("%s  top %.0f b/s"):format(fmtDist(STATS.dist), STATS.topSpeed), COLOR.text)
-  if invSource == "none" then
-    HUD.row("items", "need detector", COLOR.label)
+  -- HP bar
+  local hp, maxHp = w and w.health, (w and w.maxHealth) or 20
+  if hp then
+    HUD.bar("hp", hp / maxHp, ("%d/%d"):format(math.floor(hp), math.floor(maxHp)),
+            hp <= 6 and COLOR.bad or (hp <= 12 and COLOR.warn or MEKA.main))
   else
-    HUD.row("items", ("%d  +%d -%d"):format(beforeTotal or 0, STATS.gained, STATS.used), COLOR.text)
+    HUD.bar("hp", 0, "?", MEKA.dim)
   end
-  HUD.row("hp", ("-%d +%d  %d dead"):format(math.floor(STATS.dmg), math.floor(STATS.heal), STATS.deaths),
-          STATS.deaths > 0 and COLOR.warn or COLOR.text)
-  HUD.row("seen", STATS.seenCount .. (STATS.seenCount == 1 and " player" or " players"), COLOR.text)
-  if not HW.scanner then
-    HUD.row("ores", "no scanner", COLOR.label)
+  -- inventory fill bar (36 slots + armour + offhand)
+  if STATS.stacks then
+    HUD.bar("inv", STATS.stacks / 41, ("%d/41"):format(STATS.stacks),
+            STATS.stacks >= 36 and COLOR.warn or MEKA.main)
   else
-    HUD.row("ores", STATS.oresNear .. " near" .. (STATS.bestOre and ("  " .. STATS.bestOre:gsub("ancient_", "")) or ""),
-            STATS.bestOre and (STATS.bestOre:find("diamond") or STATS.bestOre:find("debris") or STATS.bestOre:find("emerald"))
-              and COLOR.good or COLOR.text)
+    HUD.bar("inv", 0, "no detector", MEKA.dim)
+  end
+
+  local up = math.floor((nowMs() - STATS.started) / 1000)
+  HUD.row("spd", ("%.1f b/s  top %.0f"):format(STATS.speed or 0, STATS.topSpeed),
+          (STATS.speed or 0) > 12 and COLOR.warn or MEKA.main)
+  HUD.row("dist", ("%s  %dh %02dm"):format(fmtDist(STATS.dist), math.floor(up / 3600), math.floor(up / 60) % 60))
+  if not HW.scanner then
+    HUD.row("ores", "no scanner", MEKA.dim)
+  else
+    local best = STATS.bestOre and STATS.bestOre:gsub("ancient_", "")
+    HUD.row("ores", STATS.oresNear .. (best and ("  " .. best) or ""),
+            (best and (best:find("diamond") or best:find("debris") or best:find("emerald"))) and COLOR.good or MEKA.main)
   end
 
   -- managers: how many here + nearest one's distance and direction
@@ -991,14 +1001,14 @@ local function refreshRows()
     if not nearest or m.dist < nearest.dist then nearest = m end
   end
   if not HW.scanner then
-    HUD.row("mgr", "no scanner", COLOR.label)
+    HUD.row("mgr", "no scanner", MEKA.dim)
   elseif nearest then
     HUD.row("mgr", ("%d here %dm %s"):format(mc, math.floor(nearest.dist), arrowTo(nearest.x + 0.5, nearest.z + 0.5)), COLOR.bad)
   else
-    HUD.row("mgr", stats.managers .. " known", COLOR.text)
+    HUD.row("mgr", stats.managers .. " known", MEKA.main)
   end
 
-  -- contacts card
+  -- contacts
   local list = {}
   for _, n in ipairs(nearbyList()) do
     local p = playerPos[n]
@@ -1296,32 +1306,35 @@ local function HUD_TOOLKIT(...)
   ---------------------------------------------------------------------
   local PANEL_X, PANEL_Y = U(4), 80
 
-  local COMPASS_W
-  -- compass bar sits above the armour/health/hotbar rows, below Jade's tooltip
-  local function barTop() return LAYOUT.H - 58 - U(15) end
+  -- Bottom-left: round compass with your coordinates inside (MekaSuit
+  -- style). Kept above Mekanism's own bottom-left HUD text.
   local buildCompass   -- defined with the compass code below
+  local function ring()
+    local R = U(38)
+    local cx = U(14) + R
+    local cy = LAYOUT.H - 44 - U(16) - R
+    return cx, cy, R
+  end
 
-  -- Left side: NAV card.  Bottom centre: compass bar.
   local function buildHud()
     for _, o in pairs(hud) do removeObj(o) end
     hud = {}
     if not hudShown then return end
-    COMPASS_W = U(170)
-    local x, y, w = PANEL_X, PANEL_Y, CARD.W()
-    local list = {}
-    card(list, x, y, w, 4, "NAV", COLOR.accent)
-    for i, o in ipairs(list) do hud["c" .. i] = o end
-    hud.clock = text(x + w - U(32), y + U(3), "", COLOR.label)
-    for i, l in ipairs({ "POS", "FACE", "SPD", "MODE" }) do hud["l" .. i] = text(x + U(7), rowY(y, i), l, COLOR.label) end
-    hud.pos  = text(x + U(44), rowY(y, 1), "", COLOR.text)
-    hud.face = text(x + U(44), rowY(y, 2), "", COLOR.text)
-    hud.spd  = text(x + U(44), rowY(y, 3), "", COLOR.text)
-    hud.mode = text(x + U(44), rowY(y, 4), "", COLOR.text)
-    -- compass bar
-    local cx, cy = LAYOUT.W / 2, barTop()
-    hud.cbg   = rect(cx - COMPASS_W / 2, cy, COMPASS_W, U(14), COLOR.panel, 0.82)
-    hud.cline = rect(cx - COMPASS_W / 2, cy + U(13), COMPASS_W, U(1), COLOR.accent, 1)
-    hud.notch = rect(cx - U(0.5), cy - U(4), U(1), U(4), 0xFFFFFF, 1)
+    local cx, cy, R = ring()
+    try(overlay.setAutoUpdate, false)
+    for i = 0, 35 do
+      local a = math.rad(i * 10)
+      local d = (i % 3 == 0) and U(1.6) or U(1)
+      hud["r" .. i] = rect(cx + R * math.sin(a) - d / 2, cy - R * math.cos(a) - d / 2, d, d,
+                           (i % 3 == 0) and MEKA.main or MEKA.dim, 0.9)
+    end
+    hud.top  = rect(cx - U(0.5), cy - R - U(7), U(1), U(5), MEKA.main, 1)   -- you face here
+    hud.cx   = text(cx - U(16), cy - U(15), "", MEKA.main)
+    hud.cy   = text(cx - U(16), cy - U(4), "", MEKA.main)
+    hud.cz   = text(cx - U(16), cy + U(7), "", MEKA.main)
+    hud.face = text(cx - R, cy + R + U(6), "", MEKA.main)
+    hud.mode = text(cx + R + U(10), cy + U(8), "", MEKA.dim)
+    try(overlay.update); try(overlay.setAutoUpdate, true)
     buildCompass()
   end
 
@@ -1371,20 +1384,12 @@ local function HUD_TOOLKIT(...)
 
   local function bearingTo(dx, dz) return (math.deg(atan2(-dx, dz)) + 360) % 360 end
 
-  -- Compass: each letter is its own text, created ONCE and slid sideways
-  -- with a setter (new objects fly in from x=0, so we never recreate them
-  -- per frame). If this AP build has no position setter, letters are only
-  -- recreated when your heading changes by a few degrees.
-  local compass = nil          -- { marks = {...}, wp = rect, label = text, low = text }
-  local COMPASS_MARKS = {}
-  for a = 0, 345, 15 do
-    local names = { [0] = "S", [90] = "W", [180] = "N", [270] = "E",
-                    [45] = "SW", [135] = "NW", [225] = "NE", [315] = "SE" }
-    local n = names[a] or "."
-    COMPASS_MARKS[#COMPASS_MARKS + 1] = { a = a, label = n,
-      color = (a % 90 == 0) and COLOR.text or COLOR.label }
-  end
-  local canMove = nil          -- learned on first use
+  -- Compass letters ride around the ring as you turn. Created ONCE and
+  -- moved with setters (new objects fly in from 0). Builds without setters
+  -- re-place them only when your heading changes by a few degrees.
+  local compass = nil
+  local LETTERS = { { a = 180, l = "N" }, { a = 270, l = "E" }, { a = 0, l = "S" }, { a = 90, l = "W" } }
+  local canMove = nil
   local lastYawKey = nil
 
   local function clearCompass()
@@ -1394,72 +1399,61 @@ local function HUD_TOOLKIT(...)
     compass = nil
   end
 
+  local function letterColor(l) return l == "N" and COLOR.bad or MEKA.main end
+
   function buildCompass()
     clearCompass()
     if not hudShown then return end
-    local cx, cy = LAYOUT.W / 2, barTop()
+    local cx, cy, R = ring()
     compass = { marks = {} }
-    for i, m in ipairs(COMPASS_MARKS) do
-      compass.marks[i] = { a = m.a, label = m.label, color = m.color,
-                           obj = text(cx, cy + U(3), "", m.color) }
+    for i, m in ipairs(LETTERS) do
+      compass.marks[i] = { a = m.a, l = m.l, obj = text(cx, cy, "", letterColor(m.l)) }
     end
-    compass.wp    = nil
-    compass.label = text(cx - U(40), cy - U(15), "", COLOR.waypoint)
-    compass.low   = text(cx - U(40), LAYOUT.H / 2 + 12, "", COLOR.bad)
-    compass.wpX   = nil
+    compass.label = text(cx + R + U(10), cy - U(14), "", COLOR.waypoint)
+    compass.low   = text(LAYOUT.W / 2 - U(40), LAYOUT.H / 2 + 12, "", COLOR.bad)
     lastYawKey = nil
   end
 
-  local function setX(obj, x)
+  local function setXY(obj, x, y)
     if canMove == false then return false end
-    local ok = moveX(obj, x)
+    local ok = moveXY(obj, x, y)
     if canMove == nil then canMove = ok end
     return ok
   end
 
   local function drawCompass(yaw, navBearing, navLabel, lowHp)
     if not compass then return end
-    local cx, cy = LAYOUT.W / 2, barTop()
-    local half = COMPASS_W / 2 - U(10)
-    local cw = U(6) / 2          -- half a character width
+    local cx, cy, R = ring()
 
     if yaw then
-      local yawKey = math.floor(yaw / 3 + 0.5)
-      if canMove == false and yawKey ~= lastYawKey then buildCompass() end
-      if canMove ~= false or yawKey ~= lastYawKey then
-        lastYawKey = yawKey
-        for _, m in ipairs(compass.marks) do
-          local rel = (m.a - yaw + 540) % 360 - 180
-          if math.abs(rel) <= 90.5 then
-            local px = cx + rel / 90 * half - #m.label * cw
-            setX(m.obj, px)
-            if canMove == false then
-              removeObj(m.obj)
-              m.obj = text(px, cy + U(3), m.label, m.color)
-            else
-              setText(m.obj, m.label)
-            end
-          else
-            setText(m.obj, "")
-          end
+      local yawKey = math.floor(yaw / 4 + 0.5)
+      local turned = yawKey ~= lastYawKey
+      for _, m in ipairs(compass.marks) do
+        local th = math.rad((m.a - yaw + 540) % 360 - 180)
+        local lx, ly = cx + R * math.sin(th) - U(3), cy - R * math.cos(th) - U(4)
+        if canMove ~= false and setXY(m.obj, lx, ly) then
+          setText(m.obj, m.l)
+        elseif turned then
+          removeObj(m.obj)
+          m.obj = text(lx, ly, m.l, letterColor(m.l))
         end
       end
+      lastYawKey = yawKey
     end
 
-    -- waypoint: gold tick above the bar + name/distance above that
+    -- waypoint: gold dot on the ring + name/distance beside the compass
     if navBearing and yaw then
-      local rel = (navBearing - yaw + 540) % 360 - 180
-      local px = cx + math.max(-1, math.min(1, rel / 90)) * half
+      local th = math.rad((navBearing - yaw + 540) % 360 - 180)
+      local px, py = cx + R * math.sin(th), cy - R * math.cos(th)
       if not compass.wp then
-        compass.wp = rect(px - U(1.5), cy - U(5), U(3), U(5), COLOR.waypoint, 1)
-      elseif canMove ~= false then
-        setX(compass.wp, px)                       -- rect x is its centre
-      elseif not compass.wpX or math.abs(compass.wpX - px) >= 3 then
-        removeObj(compass.wp); compass.wp = rect(px - U(1.5), cy - U(5), U(3), U(5), COLOR.waypoint, 1)
+        compass.wp = rect(px - U(2), py - U(2), U(4), U(4), COLOR.waypoint, 1)
+      elseif not (canMove ~= false and setXY(compass.wp, px, py)) then
+        if not compass.wpX or (compass.wpX - px) ^ 2 + (compass.wpY - py) ^ 2 >= 9 then
+          removeObj(compass.wp); compass.wp = rect(px - U(2), py - U(2), U(4), U(4), COLOR.waypoint, 1)
+        end
       end
-      compass.wpX = px
+      compass.wpX, compass.wpY = px, py
       setText(compass.label, navLabel or "")
-      if canMove ~= false then setX(compass.label, cx - #(navLabel or "") * cw) end
     else
       if compass.wp then removeObj(compass.wp); compass.wp = nil end
       compass.wpX = nil
@@ -1857,19 +1851,22 @@ local function HUD_TOOLKIT(...)
         if o.health and o.health <= 6 then lowHp = ("%d/%d"):format(math.floor(o.health), math.floor(o.maxHealth or 20)) end
         drawCompass(o.yaw, navBearing, navLabel, lowHp)
 
-        if x then set(hud.pos, ("%d %d %d"):format(math.floor(x), math.floor(y), math.floor(z))) end
-        set(hud.face, o.yaw and ("%s  %d"):format(facingName(o.yaw), math.floor((o.yaw + 180) % 360)) or "?")
+        STATS.speed = speed
+        if x then
+          set(hud.cx, ("X %d"):format(math.floor(x)))
+          set(hud.cy, ("Y %d"):format(math.floor(y)))
+          set(hud.cz, ("Z %d"):format(math.floor(z)))
+        end
         local dim = myDimension()
         local showDim = dim ~= "?" and not dim:find("overworld")
-        set(hud.spd, ("%.1f b/s%s"):format(speed, showDim and ("  " .. plainName(dim)) or ""),
-            speed > 12 and COLOR.warn or COLOR.text)
+        set(hud.face, (o.yaw and ("%s %d"):format(facingName(o.yaw), math.floor((o.yaw + 180) % 360)) or "?")
+            .. "  " .. textutils.formatTime(os.time(), true) .. (showDim and ("  " .. plainName(dim)) or ""))
         local act = {}
         if blockTargets then act[#act + 1] = "blocks" end
         if showPlayers then act[#act + 1] = "players" end
         if dark then act[#act + 1] = "dark" end
         if navTarget then act[#act + 1] = "nav" end
-        set(hud.mode, #act > 0 and table.concat(act, "+") or "idle", #act > 0 and COLOR.good or COLOR.label)
-        set(hud.clock, textutils.formatTime(os.time(), true))
+        set(hud.mode, table.concat(act, "+"), MEKA.dim)
       end
       sleep(INFO_EVERY)
     end
