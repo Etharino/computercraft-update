@@ -254,6 +254,39 @@ do
 end
 
 local RELAY_FRESH_MS = 5000
+
+-- ME system link (me_link.lua on your ME computer). Optional; same
+-- securelink protection as the relay, with its own key and channel.
+local ME_KEY_FILE = "/.me_key"
+local MELINK = { ok = false, state = {}, status = nil, at = 0, nextId = 0, lastSeal = 0 }
+do
+  local link = RELAY.link
+  if args[1] == "mepair" then
+    local key = args[2] and args[2]:gsub("%s", "")
+    if not link then
+      print("securelink.lua is missing on the glasses. Download it first.")
+    elseif not key or not link.keys(key) then
+      print("Usage: evidencelog mepair <key from me_link setup>")
+    else
+      local f = fs.open(ME_KEY_FILE, "w"); f.write(key); f.close()
+      print("ME linked. Channel " .. link.keys(key).channel .. ". Now run: evidencelog")
+    end
+    return
+  end
+  if link and HW.modem and fs.exists(ME_KEY_FILE) then
+    local f = fs.open(ME_KEY_FILE, "r"); local key = (f.readAll() or ""):gsub("%s", ""); f.close()
+    MELINK.keys = link.keys(key)
+    if MELINK.keys then HW.modem.open(MELINK.keys.channel); MELINK.ok = true end
+  end
+end
+local function meSend(tbl)
+  if not MELINK.ok then return false end
+  while os.epoch("utc") <= MELINK.lastSeal do sleep(0) end   -- one packet per ms
+  local packet = RELAY.link.seal(MELINK.keys, textutils.serialize(tbl, { compact = true }))
+  MELINK.lastSeal = packet.s
+  HW.modem.transmit(MELINK.keys.channel, MELINK.keys.channel, packet)
+  return true
+end
 local function relayFresh()
   return RELAY.latest and (os.epoch("utc") - RELAY.latest.at) < RELAY_FRESH_MS
 end
@@ -375,7 +408,8 @@ end
 local MEKA = { main = 0x3CF0E6, dim = 0x2A9C96, faint = 0x184B48 }
 
 local SLINES = { "hp", "inv", "spd", "dist", "ores", "mgr" }
-local LABELS = { hp = "HP", inv = "INV", spd = "SPD", dist = "DIST", ores = "ORES", mgr = "MGR" }
+local LABELS = { hp = "HP", inv = "INV", spd = "SPD", dist = "DIST", ores = "ORES", mgr = "MGR", me = "ME" }
+if MELINK.ok then SLINES[#SLINES + 1] = "me" end
 local BAR_SEGS = 12
 local rowValues = {}
 
@@ -555,10 +589,8 @@ end
 local function markerBoxes(x, y, z, distance)
   local list = {}
   local function box(size, color, opacity)
-    local o = (1 - size) / 2
-    local bx, by, bz
-    if SETTINGS.ANCHOR == "center" then bx, by, bz = x + 0.5, y + 0.5, z + 0.5
-    else bx, by, bz = x + o, y + o, z + o end
+    -- boxes are drawn centred on x/y/z: use the middle of the block
+    local bx, by, bz = x + 0.5, y + 0.5, z + 0.5
     return try(HW.overlay.createBox, {
       x = bx + SETTINGS.OFFSET.x, y = by + SETTINGS.OFFSET.y, z = bz + SETTINGS.OFFSET.z,
       sizeX = size, sizeY = size, sizeZ = size,
@@ -1008,6 +1040,34 @@ local function refreshRows()
     HUD.row("mgr", stats.managers .. " known", MEKA.main)
   end
 
+  -- ME system
+  if MELINK.ok then
+    local st = MELINK.status
+    if not st or nowMs() - MELINK.at > 20000 then
+      HUD.row("me", st and "link lost" or "waiting...", MEKA.dim)
+    elseif not st.online then
+      HUD.row("me", "OFFLINE", COLOR.bad)
+    else
+      local function short(n)
+        if n >= 1e6 then return ("%.1fM"):format(n / 1e6) elseif n >= 1e3 then return ("%.1fk"):format(n / 1e3) end
+        return tostring(math.floor(n))
+      end
+      local txt = short(st.total or 0)
+      local col = MEKA.main
+      if st.used and st.cap and st.cap > 0 then
+        local pct = math.floor(st.used / st.cap * 100)
+        txt = txt .. "  " .. pct .. "%"
+        if pct >= 90 then col = COLOR.warn end
+      end
+      if st.energy and st.maxEnergy and st.maxEnergy > 0 then
+        local e = math.floor(st.energy / st.maxEnergy * 100)
+        txt = txt .. "  pwr " .. e .. "%"
+        if e <= 10 then col = COLOR.bad end
+      end
+      HUD.row("me", txt, col)
+    end
+  end
+
   -- contacts
   local list = {}
   for _, n in ipairs(nearbyList()) do
@@ -1140,6 +1200,34 @@ local function run()
       refreshRows()
       HUD.tick()
       timer = os.startTimer(0.25)
+    elseif event == "modem_message" and MELINK.ok and b == MELINK.keys.channel then
+      local plainText = RELAY.link.open(MELINK.keys, MELINK.state, ev[5])
+      local msg = plainText and textutils.unserialize(plainText)
+      if type(msg) == "table" then
+        if msg.t == "status" then
+          MELINK.status, MELINK.at = msg, nowMs()
+        elseif msg.t == "drop" then
+          local first = msg.items and msg.items[1]
+          local what = first and (first.count .. " " .. first.name) or "items"
+          HUD.alert(("ME -%d  %s%s"):format(msg.total or 0, what,
+            (msg.near and msg.near ~= "nobody") and ("  (" .. msg.near .. ")") or ""),
+            msg.valuable and COLOR.bad or COLOR.warn)
+          out(("ME -%d taken, near: %s"):format(msg.total or 0, tostring(msg.near or "?")), colours.orange)
+          for _, it in ipairs(msg.items or {}) do out(("  -%d %s"):format(it.count, it.name), colours.orange) end
+        elseif msg.t == "reply" then
+          if (msg.matches or 0) == 0 then
+            out("ME: no '" .. tostring(msg.q) .. "'", colours.orange)
+            HUD.alert("ME: none found", COLOR.warn)
+          else
+            out(("ME '%s': %d match%s"):format(msg.q, msg.matches, msg.matches == 1 and "" or "es"), colours.yellow)
+            for _, r in ipairs(msg.results or {}) do
+              out(("%7d %s"):format(r.count, shorten(r.name, 17)))
+            end
+            local top = msg.results[1]
+            HUD.alert(("ME: %d %s"):format(top.count, shorten(top.name, 20)), MEKA.main)
+          end
+        end
+      end
     elseif event == "modem_message" and RELAY.ok and b == RELAY.keys.channel then
       local plain, why = RELAY.link.open(RELAY.keys, RELAY.state, ev[5])
       if plain then
@@ -1275,9 +1363,11 @@ local function HUD_TOOLKIT(...)
     try(overlay.update); try(overlay.setAutoUpdate, true)
   end
 
+  -- Takes the box's minimum corner; the overlay draws boxes CENTRED on
+  -- x/y/z, so convert corner -> centre here.
   local function box(x, y, z, sx, sy, sz, color, opacity)
     return try(overlay.createBox, {
-      x = x, y = y, z = z, sizeX = sx, sizeY = sy, sizeZ = sz,
+      x = x + sx / 2, y = y + sy / 2, z = z + sz / 2, sizeX = sx, sizeY = sy, sizeZ = sz,
       color = color, opacity = opacity or 0.5, depthTest = false, depthMask = false,
     })
   end
@@ -1625,7 +1715,7 @@ local function HUD_TOOLKIT(...)
     if dimObj then removeObj(dimObj); dimObj = nil end
     if on then
       dimObj = try(overlay.createBox, {
-        relativePosition = true, x = -32, y = -32, z = -32,
+        relativePosition = true, x = 0, y = 0, z = 0,   -- centred on your head
         sizeX = 64, sizeY = 64, sizeZ = 64, color = 0x000000, opacity = 0.8,
         culling = false, depthTest = false, depthMask = false,
       })
@@ -1955,6 +2045,7 @@ local LOG_HELP = {
   "-- general --",
   "stats      session stats",
   "managers   list known",
+  "me [item]  ME status/find",
   "ally add/del/list <n>",
   "me <name>  set your name",
   "uisize <n>  HUD size",
@@ -2033,6 +2124,25 @@ local function inputLoop()
     elseif cmd == "mark" or cmd == "m" then mark("typed")
     elseif cmd == "summary" or cmd == "s" or cmd == "stats" then showStats()
     elseif cmd == "managers" or cmd == "mgrs" then listManagers()
+    elseif cmd == "me" then
+      if not MELINK.ok then
+        out("ME not linked.", colours.orange)
+        out("me_link setup on the ME pc,", colours.lightGrey)
+        out("then: evidencelog mepair <key>", colours.lightGrey)
+      elseif words[2] then
+        MELINK.nextId = MELINK.nextId + 1
+        local q = table.concat(words, " ", 2)
+        meSend({ t = "query", q = q, id = MELINK.nextId })
+        out("asking ME for '" .. q .. "'...", colours.lightGrey)
+      else
+        local st = MELINK.status
+        if not st then out("no data from ME yet") else
+          out(("ME %s"):format(st.online and "online" or "OFFLINE"), st.online and colours.lime or colours.red)
+          out(("items %d  types %d"):format(st.total or 0, st.types or 0))
+          if st.used and st.cap then out(("storage %d/%d"):format(st.used, st.cap)) end
+          if st.energy and st.maxEnergy then out(("power %d/%d"):format(math.floor(st.energy), math.floor(st.maxEnergy))) end
+        end
+      end
     elseif cmd == "me" then
       if words[2] then setSelf(words[2]); out("you are " .. words[2], colours.lime)
       else
