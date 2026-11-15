@@ -82,7 +82,7 @@ local SETTINGS = {
   WATCH_BLOCKS      = { "inventory_manager" },
 
   -- Look
-  HUD_X = 6, HUD_Y = 6, HUD_WIDTH = 230,
+  HUD_X = 6, HUD_Y = 6, HUD_WIDTH = 250,
   ALERT_SECONDS     = 15,
   MARKER_LABELS     = true,            -- floating "INVENTORY MANAGER" text
 
@@ -920,8 +920,9 @@ local function HUD_TOOLKIT(...)
     hud = {}
     if not hudShown then return end
     local x, y, w = PANEL_X, PANEL_Y, PANEL_W
-    hud.bg     = rect(x, y, w, 70, COLOR.panel, 0.7)
+    hud.bg     = rect(x, y, w, 68, COLOR.panel, 0.72)
     hud.bar    = rect(x, y, w, 14, COLOR.bar, 0.9)
+    hud.stripe = rect(x, y + 14, w, 1, COLOR.accent, 1)
     hud.title  = text(x + 6, y + 3, "HUD", COLOR.accent)
     hud.clock  = text(x + w - 46, y + 3, "", COLOR.label)
     hud.pos    = text(x + 6, y + 19, "", COLOR.text)
@@ -930,8 +931,11 @@ local function HUD_TOOLKIT(...)
     hud.msg    = text(x + 6, y + 54, "type 'help' on the glasses", COLOR.label)
   end
 
+  -- Panel is PANEL_W wide; at ~6px/char that's room for ~ (PANEL_W/6 - 2) chars.
+  local LINE_CHARS = math.floor(PANEL_W / 6) - 2
   local function set(obj, content, color)
     if not obj then return end
+    if type(content) == "string" then content = shorten(content, LINE_CHARS) end
     pcall(obj.setContent, content)
     if color and obj.setColor then pcall(obj.setColor, color) end
   end
